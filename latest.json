@@ -1,0 +1,458 @@
+{
+ "format": 2,
+ "version": "1.5.1",
+ "notes": "Starting three or more games at once crashed the launcher, taking the games inside it down too. Games now start one after another, and the launcher records what happens so any crash left can be tracked down.\n\nFixed\n- Starting several games together crashed Golem Launcher right after the third one went inside (all three were loading at the same moment). Now each game starts once the one before has finished loading. Play all and pressing Play on several games both wait their turn\n\nChanged\n- Games waiting their turn show \"Waiting\" instead of \"Starting\"",
+ "size": 145762429,
+ "sha256": "b8308a441d6039ea0bf1efb654db64a455dce13a190fd8d8eeb82615a721242e",
+ "buildId": "16fe90444e49387b",
+ "stub": {
+  "h": "f35e39aaaa652b51241ec0e350af7ee5f173475dcae0fdda081796aa4d1a922c",
+  "size": 86528
+ },
+ "files": [
+  {
+   "path": "Golem Launcher.exe",
+   "size": 249978368,
+   "chunks": [
+    {
+     "h": "ffe28dc7e354b3a044f474d4840125e0f29713846ceecd33d7724c14fd4e2c35",
+     "stored": 4275084,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "21a6d7d7cd41454cb99e83c4b723e275c64bc621c6b3caa65b156b61796df626",
+     "stored": 4449386,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "5d9c4312a6a389f2a2b722ce71b573402344af42c8fcbf96c55ba6c44f88a8b4",
+     "stored": 3750240,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "8cf84568c34e43396ce663f02e7df97f635c755935e2e183606ee869f7876c7c",
+     "stored": 4003586,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "c266dbd6539322d7672e755c33921a9c56d2de3ffcf34cc3c8dfb909c66c9965",
+     "stored": 4085874,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "7464befff15855f9771c608ee703a29bdbfcd815736df691f34646d6b79f9c67",
+     "stored": 4118705,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "53c3425e79199c0ec5a00bcfb9481b65deacf978d1b53016a1169d97c54d8af1",
+     "stored": 3949048,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "2c765d06e387f2a9b19e4673c8a54f4dd917bf18654c623450e5544f92438b25",
+     "stored": 3619943,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "847d271ac9f306b429225ee76e2c1b265ec1e6f57d9efb66c4fd2e6a8b4ae011",
+     "stored": 3560097,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "dad646c6b446892b2ffcc48e25d1a8180a9cb224833e76c1a9959b90c5195cbe",
+     "stored": 3589550,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "283c37e23edd8af5f0796baa89fd60feab5c418442b407a290acefb159d55ba8",
+     "stored": 3561686,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "da7b42d7f72d9a268f318d3fef054ced73bfcebf3fd9f6a02a24f355ad961c55",
+     "stored": 2858500,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "85c8512bc8d02098badbd0306013094b3f4435eee4c7e123a510aee62f6236b1",
+     "stored": 3980067,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "2f5dcfc7e4ace2c218c9d7cc4834743b6889d32f313e2b03ba6feaf1989f6534",
+     "stored": 3648370,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "654e3fe68e4e3176ddbcf39ce6befed8d35db49998c86cb5c28ec147c32547ac",
+     "stored": 3964877,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "55eab97f0d4c5eebd554901fb0f672cd0143e0a97fad8e261f022167cfd4f71b",
+     "stored": 3776349,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "d207a45d663e3f58488be885e15722b2a4d85acac2adc1becf9dee374ff974f6",
+     "stored": 3964872,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "fb2e06f1e7ae822bcace2346469253e0cb0e68df8040b7cd8b7b025e9db1d84a",
+     "stored": 3902098,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "9e7e5a57e7f6520c8556cecdf9f762497efc1bf7bd1d563a92343e04e63a90b8",
+     "stored": 3826764,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "92f3ca9717bb52e5e9c1fa98e524c06bfddf8a4ba006f1be481f1e764cdc0253",
+     "stored": 3965454,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "c514eafd81214f84f188a6065a23c38fb3e67388092c776cd5801ebc98af817d",
+     "stored": 3833117,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "367976d557fe7dc62c025e2ccb42ed84af095768957fe897cfd86b0b4db19e96",
+     "stored": 3162077,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "6d8f31f250416f19aca2efe60a1104e7b6eda632f550ff193d5337d92a58d3c6",
+     "stored": 3591983,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "5f0c24410c060f1b9dcaf42fe25ee3705b71dc2bb2cbe87517f128d1e7bfb773",
+     "stored": 2922630,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "4b3b1ca7e17925093dccb2698f484c61921f8efca50030e8aab5661efbc8fb3b",
+     "stored": 2651510,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "13f51ea403375056b90092e7d97c3aa8bfeb876b69302b21d945eb2ffa05b900",
+     "stored": 2952797,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "b93a7ee02dfbb96213bc4a6175de194b4c24c23ce0938bebfebbc665c81d2522",
+     "stored": 3396593,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "a6f94d6f6bf697700f9d593b0e6875021c23d9d158c38f419f8bd48a881c044c",
+     "stored": 3266128,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "ba84edc7ffefc8c86c1e2425f2a65c7506c4bd299b116bcc9490f27c40c9c74e",
+     "stored": 2632161,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "31c184495a9b3eed6f3a3a13594bb76e583b21c93eb996d12f44f04c4a955e70",
+     "stored": 2798051,
+     "size": 6708736,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "LICENSE",
+   "size": 1096,
+   "chunks": [
+    {
+     "h": "94f463d1b44aaccf4ee8ab31fed976eefe914fb09df0cfd87388bc23e1b1ef18",
+     "stored": 640,
+     "size": 1096,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "LICENSES.chromium.html",
+   "size": 5705935,
+   "chunks": [
+    {
+     "h": "d820cb4d27958c2c20d136a9fbd0a8a4c5612c0e4b3cf321c2585e1ef02125ee",
+     "stored": 687844,
+     "size": 5705935,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "chrome_100_percent.pak",
+   "size": 568479,
+   "chunks": [
+    {
+     "h": "fce12bf7c545a549f3bada741d4dea8c6ce12a55868fe22a7ee8367d3769cc71",
+     "stored": 547274,
+     "size": 568479,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "chrome_200_percent.pak",
+   "size": 927818,
+   "chunks": [
+    {
+     "h": "152077a9203c8cf655bd0fbae1b0f973fab803da1b0aa628de4e7873aae34d64",
+     "stored": 890320,
+     "size": 927818,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "d3dcompiler_47.dll",
+   "size": 4753864,
+   "chunks": [
+    {
+     "h": "e73f3399a0ae330627e43918c046442e252453c1e211e2fd7e227cb8bcc6ee04",
+     "stored": 2141690,
+     "size": 4753864,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "dxcompiler.dll",
+   "size": 25779712,
+   "chunks": [
+    {
+     "h": "c29d11bac82fa19d58912441ed6dee1ff32a6b6e39e2412603ec76d68578040b",
+     "stored": 3336983,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "64009ce0a5cf86d3a67e48a6f8f53c384bd4f3728ae982bebb6f8627d708a026",
+     "stored": 3559766,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "eefd5237206bfea6dc3800c91b32f6eaa73462fa30fa23d39957433ffc7825aa",
+     "stored": 2956419,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "a3a6f1d2bb40b129c989d3408432cede42d0f72e5142b320644ae48815226229",
+     "stored": 289266,
+     "size": 613888,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "electron_wer.dll",
+   "size": 425472,
+   "chunks": [
+    {
+     "h": "838a83c7c0fdde344e848dc1b884c4313ef17c74825495829ae1ed309ad07c6a",
+     "stored": 193319,
+     "size": 425472,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "ffmpeg.dll",
+   "size": 3097600,
+   "chunks": [
+    {
+     "h": "22209e6388cd4fead07b203c09c3bd405f791f993210ce298cfaeca832f8f836",
+     "stored": 1256798,
+     "size": 3097600,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "icudtl.dat",
+   "size": 10824576,
+   "chunks": [
+    {
+     "h": "7b55336fbe5d56eb86f65d609837f39b5fcb32d67dcb25e822efcd42c3e3cc4b",
+     "stored": 3822041,
+     "size": 8388608,
+     "method": 1
+    },
+    {
+     "h": "1111ab62d983762536da8d465f2a371e5a5ef32a08cf0b20c6aa76ab6777ce99",
+     "stored": 773046,
+     "size": 2435968,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "resources.pak",
+   "size": 13372210,
+   "chunks": [
+    {
+     "h": "7b2111f70c5f34634871713403d8630ae03657837dcabbbdb9032a9801544808",
+     "stored": 8388608,
+     "size": 8388608,
+     "method": 0
+    },
+    {
+     "h": "e0dd30ade9ab30eb8cc59595e015e2efc7bbe8f74a378730d8c2a8f0388bd7d3",
+     "stored": 4983602,
+     "size": 4983602,
+     "method": 0
+    }
+   ]
+  },
+  {
+   "path": "snapshot_blob.bin",
+   "size": 374568,
+   "chunks": [
+    {
+     "h": "e737767d396e1e1a522a5ac7ed7b1dcb9291ddebf79d9967c8003457bd756eb3",
+     "stored": 83788,
+     "size": 374568,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "v8_context_snapshot.bin",
+   "size": 753600,
+   "chunks": [
+    {
+     "h": "4bb8d29679065b34fdb7299e4c3e4d1a338110f42ca0a3e7488dd73a9b32a167",
+     "stored": 213943,
+     "size": 753600,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "version",
+   "size": 6,
+   "chunks": [
+    {
+     "h": "73e4aa50956e86989ac3777bd8c09181d05b20fe43a7972838b7800d6fdbf659",
+     "stored": 6,
+     "size": 6,
+     "method": 0
+    }
+   ]
+  },
+  {
+   "path": "vk_swiftshader.dll",
+   "size": 5452800,
+   "chunks": [
+    {
+     "h": "d336d469d8c301f666cbf6bab6b06a9473d98e602d6a455dfae0a6506a2051aa",
+     "stored": 2152706,
+     "size": 5452800,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "vk_swiftshader_icd.json",
+   "size": 106,
+   "chunks": [
+    {
+     "h": "22fbc418ce9494c9aa017f79136709f2c30912daf60a2e983f767cb79a131dcd",
+     "stored": 89,
+     "size": 106,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "vulkan-1.dll",
+   "size": 957440,
+   "chunks": [
+    {
+     "h": "2cec1ad49bd1bc56d93b9c075c88cfa00a2b00ea66c39e822f85663c9a805e57",
+     "stored": 372559,
+     "size": 957440,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "locales/en-US.pak",
+   "size": 592299,
+   "chunks": [
+    {
+     "h": "dd1c9ab1339c2a07addc20e0545ffa67ecdcd963ca2fbfbe5fa83044710b2413",
+     "stored": 193396,
+     "size": 592299,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "resources/app.asar",
+   "size": 1557944,
+   "chunks": [
+    {
+     "h": "aaa3da0a5d919b625f6c41e4fca62b94fa84233caccef136405c3850ea170801",
+     "stored": 349478,
+     "size": 1557944,
+     "method": 1
+    }
+   ]
+  },
+  {
+   "path": "resources/koffi/win32_x64/koffi.node",
+   "size": 1060352,
+   "chunks": [
+    {
+     "h": "bdabd53f6018e7df2c1c950862d7fac106253d30c93528781eceaa2ca889f4c0",
+     "stored": 423138,
+     "size": 1060352,
+     "method": 1
+    }
+   ]
+  }
+ ]
+}

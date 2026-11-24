@@ -1,0 +1,126 @@
+'use strict'
+// "Add account" window like a launcher's: Microsoft's own sign-in page with its
+// "Choose an account" list, in a small browser window with its own saved profile
+// (so accounts you used before are listed). When Microsoft hands back the login,
+// it's saved for the bot and the window closes.
+const fs = require('fs')
+const path = require('path')
+const { spawn } = require('child_process')
+const { DATA } = require('./store')
+
+const CLIENT_ID = '00000000441cc96b' // the Minecraft sign-in the bots already use
+const SCOPE = 'service::user.auth.xboxlive.com::MBI_SSL'
+const REDIRECT = process.env.GOLEM_AFK_SIGNIN_REDIRECT || 'https://login.live.com/oauth20_desktop.srf'
+const AUTHORIZE = process.env.GOLEM_AFK_SIGNIN_URL ||
+  `https://login.live.com/oauth20_authorize.srf?client_id=${CLIENT_ID}&response_type=code&scope=${encodeURIComponent(SCOPE)}` +
+  `&redirect_uri=${encodeURIComponent(REDIRECT)}&prompt=select_account`
+const PROFILE = path.join(DATA, 'signin-browser')
+
+let busy = null // only one window at a time
+
+function findBrowser () {
+  const env = process.env
+  const list = process.platform === 'win32'
+    ? [
+        path.join(env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft\\Edge\\Application\\msedge.exe'),
+        path.join(env.ProgramFiles || 'C:\\Program Files', 'Microsoft\\Edge\\Application\\msedge.exe'),
+        path.join(env.LOCALAPPDATA || '', 'Microsoft\\Edge\\Application\\msedge.exe'),
+        path.join(env.ProgramFiles || 'C:\\Program Files', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe')
+      ]
+    : process.platform === 'darwin'
+      ? ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+      : ['/usr/bin/microsoft-edge', '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']
+  return list.find(p => p && fs.existsSync(p)) || null
+}
+
+function sleep (ms) { return new Promise(r => setTimeout(r, ms)) }
+
+async function getJson (url) {
+  const res = await fetch(url)
+  return res.json()
+}
+
+// Opens the window and resolves with Microsoft's token response, or throws.
+async function pickAccount () {
+  if (busy) throw new Error('A sign-in window is already open. Finish or close it first.')
+  const exe = findBrowser()
+  if (!exe) throw new Error('No Edge or Chrome found for the sign-in window. Use the code instead.')
+  busy = true
+  fs.mkdirSync(PROFILE, { recursive: true })
+  const portFile = path.join(PROFILE, 'DevToolsActivePort')
+  fs.rmSync(portFile, { force: true })
+  const child = spawn(exe, [
+    `--user-data-dir=${PROFILE}`,
+    '--remote-debugging-port=0',
+    '--remote-allow-origins=http://127.0.0.1',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-sync',
+    '--disable-features=Translate,msEdgeSidebar',
+    '--window-size=520,760',
+    `--app=${AUTHORIZE}`,
+    ...(process.platform === 'linux' && process.getuid && process.getuid() === 0 ? ['--no-sandbox'] : []),
+    ...(process.env.GOLEM_AFK_SIGNIN_ARGS ? process.env.GOLEM_AFK_SIGNIN_ARGS.split(' ') : [])
+  ], { detached: false, stdio: 'ignore', windowsHide: false })
+  let exited = false
+  child.on('exit', () => { exited = true })
+  child.on('error', () => { exited = true })
+  try {
+    // the browser writes the port it picked to DevToolsActivePort
+    let port = null
+    for (let i = 0; i < 100 && !port; i++) {
+      await sleep(150)
+      try { port = Number(fs.readFileSync(portFile, 'utf8').split('\n')[0]) || null } catch {}
+      if (exited && !port) throw new Error("The sign-in window didn't open.")
+    }
+    if (!port) throw new Error("The sign-in window didn't open in time.")
+    const base = `http://127.0.0.1:${port}`
+    const until = Date.now() + 10 * 60 * 1000
+    let seenWindow = false
+    while (Date.now() < until) {
+      await sleep(400)
+      let targets
+      try { targets = await getJson(`${base}/json/list`) } catch { throw new Error('The sign-in window was closed.') }
+      const pages = targets.filter(t => t.type === 'page')
+      if (pages.length) seenWindow = true
+      else if (seenWindow) throw new Error('The sign-in window was closed.')
+      const done = pages.find(t => String(t.url).startsWith(REDIRECT))
+      if (!done) continue
+      const u = new URL(done.url)
+      try { await fetch(`${base}/json/close/${done.id}`) } catch {}
+      const code = u.searchParams.get('code')
+      if (!code) throw new Error(u.searchParams.get('error_description') || u.searchParams.get('error') || 'Microsoft did not sign in.')
+      return await redeem(code)
+    }
+    throw new Error('The sign-in window timed out after 10 minutes.')
+  } finally {
+    busy = null
+    setTimeout(() => { try { if (!exited) child.kill() } catch {} }, 1500)
+  }
+}
+
+async function redeem (code) {
+  if (process.env.GOLEM_AFK_SIGNIN_FAKE) return { access_token: 'fake', refresh_token: 'fake', expires_in: 3600, token_type: 'bearer', user_id: code }
+  const res = await fetch('https://login.live.com/oauth20_token.srf', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: CLIENT_ID, code, grant_type: 'authorization_code', redirect_uri: REDIRECT, scope: SCOPE }).toString()
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || !body.refresh_token) throw new Error(`Microsoft didn't accept the sign-in: ${body.error_description || body.error || res.status}`)
+  return body
+}
+
+// Saves the login where the bot's sign-in library looks for it, replacing any old account.
+function saveForBot (botId, token) {
+  const { createHash } = require('prismarine-auth/src/common/Util')
+  const dir = path.join(DATA, 'auth', botId)
+  fs.rmSync(dir, { recursive: true, force: true })
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, `${createHash(`golem-${botId}`)}_live-cache.json`)
+  fs.writeFileSync(file, JSON.stringify({ token: { ...token, obtainedOn: Date.now() } }, null, 2))
+}
+
+module.exports = { pickAccount, saveForBot, findBrowser }

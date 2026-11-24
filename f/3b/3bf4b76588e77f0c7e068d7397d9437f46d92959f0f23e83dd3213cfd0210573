@@ -1,0 +1,1114 @@
+'use strict'
+// Golem AFK dashboard
+const $ = (s, root = document) => root.querySelector(s)
+const state = { bots: new Map(), logs: new Map(), history: new Map(), selected: null, versions: [], settings: null, tab: 'chat', dirty: false, signinState: {}, sent: [], sentAt: -1, view: 'bot', macroEdit: null }
+
+// ---------- helpers ----------
+function esc (s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+async function api (method, url, body) {
+  const res = await fetch(url, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined })
+  const data = await res.json().catch(() => ({}))
+  if (res.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/setup')) { showGate(); throw new Error(data.error || 'Sign in first.') }
+  if (!res.ok) throw new Error(data.error || `Something went wrong (${res.status}).`)
+  return data
+}
+let toastTimer
+function toast (text) {
+  const t = $('#toast')
+  t.textContent = text
+  t.hidden = false
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { t.hidden = true }, 3200)
+}
+function duration (ms) {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return `${s} s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} min`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h} h ${m % 60} min`
+  return `${Math.floor(h / 24)} days ${h % 24} h`
+}
+function clock (t) {
+  return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+}
+function nameOf (b) { return b.cfg.label || b.cfg.account || b.cfg.name || 'New bot' }
+function defaultPort (b) { return b.cfg.edition === 'bedrock' ? 19132 : 25565 }
+function serverOf (b) { return b.cfg.host + (Number(b.cfg.port) !== defaultPort(b) ? ':' + b.cfg.port : '') }
+function ago (t) { return duration(Date.now() - t) + ' ago' }
+
+// ---------- sign in ----------
+async function boot () {
+  const s = await fetch('/api/session').then(r => r.json())
+  state.version = s.version
+  if (!s.signedIn) return showGate(s.needsPassword)
+  showApp()
+}
+function showGate (needsPassword) {
+  $('#app').hidden = true
+  $('#gate').hidden = false
+  const first = !!needsPassword
+  $('#gateForm').dataset.mode = first ? 'setup' : 'login'
+  $('#gateText').textContent = first ? 'Pick a password for this dashboard. You need it to open the dashboard from your phone, too.' : 'Sign in to your bots.'
+  $('#gateLabel').textContent = first ? 'New password (6 or more characters)' : 'Password'
+  $('#gatePass').autocomplete = first ? 'new-password' : 'current-password'
+  $('#gateBtn').textContent = first ? 'Set password' : 'Sign in'
+  $('#gatePass').focus()
+}
+$('#gateForm').addEventListener('submit', async e => {
+  e.preventDefault()
+  const mode = e.currentTarget.dataset.mode
+  $('#gateError').textContent = ''
+  try {
+    await api('POST', mode === 'setup' ? '/api/setup' : '/api/login', { password: $('#gatePass').value })
+    $('#gatePass').value = ''
+    showApp()
+  } catch (err) { $('#gateError').textContent = err.message }
+})
+
+async function showApp () {
+  $('#gate').hidden = true
+  $('#app').hidden = false
+  const data = await api('GET', '/api/bots')
+  state.versions = data.versions
+  state.bots.clear()
+  for (const b of data.bots) state.bots.set(b.cfg.id, b)
+  const keep = localStorage.getItem('golemafk.selected')
+  state.selected = state.bots.has(keep) ? keep : (data.bots[0] && data.bots[0].cfg.id) || null
+  render()
+  if (state.selected) selectBot(state.selected, false)
+  connectLive()
+  api('GET', '/api/update').then(u => { state.update = u; renderUpdate() }).catch(() => {})
+}
+
+// ---------- live updates ----------
+let ws
+function connectLive () {
+  if (ws && ws.readyState <= 1) return
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/live`)
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data)
+    if (msg.type === 'signin') {
+      state.signinState[msg.id] = msg.state === 'open' ? 'Sign-in window open on the PC. Choose an account there.'
+        : msg.state === 'done' ? 'Signed in. Joining...' : (msg.text || 'Sign-in did not finish.')
+      renderSigninState()
+      if (msg.state === 'done') toast('Signed in. The bot is joining with that account.')
+    } else if (msg.type === 'update') {
+      state.update = msg.update
+      renderUpdate()
+    } else if (msg.type === 'hello') {
+      for (const b of msg.bots) state.bots.set(b.cfg.id, b)
+      render()
+    } else if (msg.type === 'bot') {
+      const before = state.bots.get(msg.bot.cfg.id)
+      state.bots.set(msg.bot.cfg.id, msg.bot)
+      if (before && before.status !== msg.bot.status) noteStatus(msg.bot)
+      render()
+    } else if (msg.type === 'removed') {
+      state.bots.delete(msg.id)
+      if (state.selected === msg.id) state.selected = [...state.bots.keys()][0] || null
+      render()
+      if (state.selected) selectBot(state.selected, false)
+    } else if (msg.type === 'line') {
+      const log = state.logs.get(msg.id)
+      if (log) { log.push(msg.line); if (log.length > 100) log.shift() }
+      if (msg.id === state.selected) appendLine(msg.line)
+    }
+  }
+  ws.onclose = () => setTimeout(async () => {
+    const s = await fetch('/api/session').then(r => r.json()).catch(() => null)
+    if (s && state.version && s.version !== state.version) return location.reload()
+    if (s && !s.signedIn) return showGate(s.needsPassword)
+    connectLive()
+  }, 2000)
+}
+
+// history comes with the log; keep it fresh from status changes too
+function noteStatus (b) {
+  const list = state.history.get(b.cfg.id)
+  if (!list) return
+  const s = b.status === 'online' ? 'on' : 'off'
+  const last = list[list.length - 1]
+  if (!last || last.s !== s) list.push({ t: Date.now(), s })
+}
+
+// ---------- rendering ----------
+const STATUS_WORD = { stopped: 'Stopped', connecting: 'Connecting', signin: 'Needs sign-in', online: 'Online', waiting: 'Reconnecting', paused: 'Paused', error: 'Stopped with a problem' }
+
+function render () {
+  const bots = [...state.bots.values()]
+  const online = bots.filter(b => b.status === 'online').length
+  $('#tally').textContent = bots.length ? `${online} of ${bots.length} online` : ''
+  const grid = state.view === 'grid' && bots.length > 0
+  $('#empty').hidden = bots.length > 0
+  $('#overview').hidden = !grid
+  $('#bot').hidden = grid || !state.selected || !state.bots.has(state.selected)
+  $('#gridBtn').setAttribute('aria-pressed', grid)
+  $('#gridBtn').hidden = bots.length === 0
+  renderRoster()
+  if (grid) renderGrid()
+  else renderBot()
+}
+
+// ---------- screenshots ----------
+function shotURL (b) { return `/api/bots/${b.cfg.id}/shot.png?t=${Math.round(b.shot.t)}` }
+function labelsHTML (b) {
+  return (b.shot && b.shot.labels || []).map(l => `<span style="left:${(l.x * 100).toFixed(2)}%;top:${(l.y * 100).toFixed(2)}%">${esc(l.name)}</span>`).join('')
+}
+function shotNote (b) {
+  if (b.shot) return ''
+  return b.status === 'online' ? 'No screenshot yet. The first one comes a few seconds after the bot joins.' : 'No screenshot yet. Start the bot to get one.'
+}
+function renderScreen (b) {
+  const img = $('#screenImg')
+  const has = !!b.shot
+  if (has) {
+    const url = shotURL(b)
+    if (img.getAttribute('src') !== url) img.src = url
+    img.alt = `What ${nameOf(b)} sees`
+  } else img.removeAttribute('src')
+  $('#screenLabels').innerHTML = has ? labelsHTML(b) : ''
+  $('#screenEmpty').textContent = has ? '' : shotNote(b)
+  $('#shotBtn').disabled = b.status !== 'online' || state.shotBusy === b.cfg.id
+  renderShotCaption(b)
+}
+function renderShotCaption (b) {
+  const s = b.shot
+  $('#screenCaption').textContent = s
+    ? `Taken ${ago(s.t)}${s.facing ? `, facing ${s.facing} at ${s.x}, ${s.y}, ${s.z}` : ''}.`
+    : ''
+}
+// "1,234" -> 1234, "1.2K" -> 1200, "3M" -> 3000000
+function shardNumber (v) {
+  const m = String(v || '').replace(/,/g, '').match(/(\d+(?:\.\d+)?)\s*([kmbt])?/i)
+  if (!m) return null
+  const mult = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 }[(m[2] || '').toLowerCase()] || 1
+  return { value: parseFloat(m[1]) * mult, rough: !!m[2] }
+}
+function renderTotalShards (bots) {
+  let total = 0
+  let count = 0
+  let rough = false
+  for (const b of bots) {
+    if (b.status !== 'online' || b.stats.shards == null) continue
+    const n = shardNumber(b.stats.shards)
+    if (!n) continue
+    total += n.value
+    rough = rough || n.rough
+    count++
+  }
+  $('#totalShards').hidden = count === 0
+  $('#totalShardsNum').textContent = (rough ? 'about ' : '') + Math.round(total).toLocaleString('en-US')
+  $('#totalShardsFrom').textContent = `from ${count} bot${count === 1 ? '' : 's'} online`
+}
+
+function renderGrid () {
+  const bots = [...state.bots.values()]
+  renderTotalShards(bots)
+  $('#shotGrid').innerHTML = bots.map(b => {
+    const has = !!b.shot
+    const s = b.stats || {}
+    const where = b.status === 'online' && s.x !== undefined ? `${s.x}, ${s.y}, ${s.z}` : STATUS_WORD[b.status]
+    const shards = b.status === 'online' && s.shards != null ? `<small class="shards">${esc(s.shards)} shards</small>` : ''
+    return `<button class="shot-card" data-open="${b.cfg.id}">
+      <div class="screen-frame">
+        ${has ? `<img src="${shotURL(b)}" alt="What ${esc(nameOf(b))} sees" loading="lazy">` : ''}
+        <div class="labels">${has ? labelsHTML(b) : ''}</div>
+        <p class="screen-empty">${has ? '' : esc(shotNote(b))}</p>
+      </div>
+      <div class="meta"><span class="pip ${b.status}"></span><strong>${esc(nameOf(b))}</strong>
+        <small>${esc(where)}${has ? `, picture from ${esc(ago(b.shot.t))}` : ''}</small>${shards}</div>
+    </button>`
+  }).join('')
+}
+$('#gridBtn').addEventListener('click', () => {
+  state.view = state.view === 'grid' ? 'bot' : 'grid'
+  $('#app').classList.toggle('show-bot', state.view === 'grid')
+  render()
+})
+$('#shotGrid').addEventListener('click', e => {
+  const card = e.target.closest('[data-open]')
+  if (!card) return
+  state.view = 'bot'
+  selectBot(card.dataset.open)
+})
+$('#shotBtn').addEventListener('click', async () => {
+  const id = state.selected
+  state.shotBusy = id
+  $('#shotBtn').disabled = true
+  $('#shotBtn span').textContent = 'Taking screenshot...'
+  try {
+    const res = await api('POST', `/api/bots/${id}/screenshot`)
+    const b = state.bots.get(id)
+    if (b) { b.shot = res.shot; if (id === state.selected) renderScreen(b) }
+  } catch (err) { toast(err.message) }
+  state.shotBusy = null
+  $('#shotBtn span').textContent = 'Take screenshot now'
+  const b = state.bots.get(state.selected)
+  if (b) renderScreen(b)
+})
+
+function renderRoster () {
+  const bots = [...state.bots.values()]
+  const rows = bots.map(b => `
+    <button class="roster-row" data-id="${b.cfg.id}" aria-current="${b.cfg.id === state.selected}">
+      <span class="pip ${b.status}" title="${STATUS_WORD[b.status]}"></span>
+      <strong>${esc(nameOf(b))}</strong>
+      <small>${esc(rosterLine(b))}</small>
+      <span class="mini" aria-hidden="true">${stripHTML(b.cfg.id)}</span>
+    </button>`).join('')
+  const any = bots.length > 1
+  $('#roster').innerHTML = rows + (any
+    ? `<div class="roster-foot"><button class="btn" data-all="start"><svg><use href="#i-play"/></svg><span>Start all</span></button><button class="btn" data-all="stop"><svg><use href="#i-stop"/></svg><span>Stop all</span></button></div>`
+    : '')
+}
+
+function rosterLine (b) {
+  if (b.status === 'online') return `${serverOf(b)}, online ${duration(Date.now() - b.onlineSince)}`
+  if (b.status === 'waiting' && b.nextTry) return `Trying again in ${duration(b.nextTry - Date.now())}`
+  return `${serverOf(b)}, ${STATUS_WORD[b.status].toLowerCase()}`
+}
+
+function renderBot () {
+  const b = state.bots.get(state.selected)
+  if (!b) return
+  $('#botName').textContent = nameOf(b)
+  const who = b.cfg.auth === 'offline' ? `offline name ${b.cfg.name}` : b.cfg.account ? `Microsoft account ${b.cfg.account}` : 'Microsoft account, not signed in yet'
+  $('#botWhere').textContent = `${serverOf(b)}, ${b.edition === 'bedrock' ? 'Bedrock' : 'Java'}, ${who}`
+
+  const running = b.status !== 'stopped' && b.status !== 'error' && b.status !== 'paused'
+  $('#botActions').innerHTML = running
+    ? `<button class="btn" data-act="restart"><svg><use href="#i-redo"/></svg><span>Restart</span></button><button class="btn" data-act="stop"><svg><use href="#i-stop"/></svg><span>Stop</span></button>`
+    : `<button class="btn primary" data-act="start"><svg><use href="#i-play"/></svg><span>Start</span></button>`
+
+  renderStatus(b)
+
+  const sign = b.status === 'signin' && b.msa
+  $('#signin').hidden = !sign
+  $('#signinPC').hidden = !onThisPC
+  $('#signinRemote').hidden = onThisPC
+  if (!sign) state.signinState[b.cfg.id] = ''
+  renderSigninState()
+  if (sign && state.autoSignin === b.cfg.id && onThisPC) {
+    state.autoSignin = null
+    openSignin(b.cfg.id, true)
+  }
+  if (sign) {
+    $('#signinCode').textContent = b.msa.code
+    $('#signinLink').href = b.msa.url
+    $('#signinLink').textContent = b.msa.url.replace(/^https?:\/\/(www\.)?/, '')
+  }
+
+  renderScreen(b)
+  renderVitals(b)
+  renderStrip()
+  if (state.tab === 'macros' && !state.macroEdit) renderMacros()
+}
+
+function renderStatus (b) {
+  let text = STATUS_WORD[b.status]
+  let more = ''
+  if (b.status === 'online') text = `Online for ${duration(Date.now() - b.onlineSince)}`
+  if (b.status === 'waiting') {
+    text = b.nextTry ? `Reconnecting in ${duration(b.nextTry - Date.now())}` : 'Reconnecting'
+    more = b.detail ? `after: ${b.detail}` : ''
+  }
+  if (b.status === 'connecting' || b.status === 'paused' || b.status === 'error') more = b.detail || ''
+  if (b.status === 'signin') more = 'Press Choose account below.'
+  if (b.status === 'stopped' && b.detail) more = b.detail
+  $('#statusLine').innerHTML = `<span class="pip ${b.status}"></span><span><strong>${esc(text)}</strong>${more ? ` <em>${esc(more)}</em>` : ''}</span>`
+}
+
+// pixel icons drawn on a 7x7 grid
+const HEART = ['.XX.XX.', 'XHXXXXX', 'XXXXXXX', '.XXXXX.', '..XXX..', '...X...']
+const MEAT = ['...BBB.', '..BBBBB', '..BBBBB', '.BBBBB.', '.WBB...', 'WW.....', 'W......']
+function pixelIcon (rows, fill, empty, part, offY = 0) {
+  // part: 2 full, 1 half (left half), 0 empty
+  let r = ''
+  rows.forEach((row, y) => {
+    for (let x = 0; x < row.length; x++) {
+      const c = row[x]
+      if (c === '.') continue
+      const lit = part === 2 || (part === 1 && x <= 3)
+      const color = lit ? (fill[c] || fill.X) : empty
+      r += `<rect x="${x}" y="${y + offY}" width="1" height="1" fill="${color}"/>`
+    }
+  })
+  return `<svg viewBox="0 0 7 7" aria-hidden="true">${r}</svg>`
+}
+function iconRow (value, rows, fill, offY) {
+  let out = ''
+  for (let i = 0; i < 10; i++) {
+    const left = value - i * 2
+    out += pixelIcon(rows, fill, '#3B3F45', left >= 2 ? 2 : left === 1 ? 1 : 0, offY)
+  }
+  return out
+}
+function renderVitals (b) {
+  const s = b.stats || {}
+  const on = b.status === 'online' && typeof s.health === 'number'
+  const health = on ? Math.round(s.health) : 20
+  const food = on && typeof s.food === 'number' ? s.food : 20
+  const hearts = $('#hearts')
+  hearts.innerHTML = iconRow(health, HEART, { X: '#D8343E', H: '#F6C3C6' }, 0.5)
+  hearts.classList.toggle('off', !on)
+  hearts.setAttribute('aria-label', on ? `Health ${health / 2} of 10 hearts` : 'Health unknown while offline')
+  const hunger = $('#hunger')
+  hunger.innerHTML = iconRow(food, MEAT, { B: '#B8662F', W: '#EDE6D6' }, 0)
+  hunger.classList.toggle('off', !on)
+  hunger.setAttribute('aria-label', on ? `Hunger ${food / 2} of 10` : 'Hunger unknown while offline')
+
+  const world = { overworld: 'Overworld', the_nether: 'Nether', the_end: 'The End' }
+  $('#facts').innerHTML = on
+    ? fact('Position', `${s.x}, ${s.y}, ${s.z}`) +
+      fact('World', world[s.dimension] || s.dimension || 'Unknown') +
+      fact('Ping', s.ping != null ? `${s.ping} ms` : 'Unknown') +
+      fact('Players here', s.players ?? 'Unknown') +
+      (s.shards != null ? `<div><dt>Shards</dt><dd class="shards">${esc(s.shards)}</dd></div>` : '')
+    : `<div><dt>Not in a world</dt><dd>Health, food and position show up while the bot is online.</dd></div>`
+  const bar = $('#actionBar')
+  bar.hidden = !(on && s.actionBar)
+  bar.textContent = on && s.actionBar ? s.actionBar : ''
+}
+function fact (k, v) { return `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>` }
+
+// 24 hour uptime strip
+function segments (id, from, to) {
+  const list = state.history.get(id) || []
+  const out = []
+  let cur = 'off'
+  for (const h of list) { if (h.t <= from) cur = h.s; else break }
+  let t = from
+  for (const h of list) {
+    if (h.t <= from) continue
+    if (h.t >= to) break
+    if (h.s !== cur) { out.push({ s: cur, w: h.t - t }); t = h.t; cur = h.s }
+  }
+  out.push({ s: cur, w: to - t })
+  return out
+}
+function stripHTML (id) {
+  const now = Date.now()
+  const total = 24 * 3600e3
+  if (!state.history.has(id)) {
+    const b = state.bots.get(id)
+    return b && b.status === 'online' ? '<i class="on" style="width:100%"></i>' : ''
+  }
+  return segments(id, now - total, now).map(g => `<i class="${g.s}" style="width:${(g.w / total * 100).toFixed(3)}%"></i>`).join('')
+}
+function renderStrip () {
+  const id = state.selected
+  if (!id) return
+  const now = Date.now()
+  const total = 24 * 3600e3
+  $('#strip').innerHTML = stripHTML(id)
+  const on = segments(id, now - total, now).filter(g => g.s === 'on').reduce((a, g) => a + g.w, 0)
+  $('#uptimePct').textContent = state.history.has(id) ? `Online ${Math.round(on / total * 100)}% of the time` : ''
+  let ticks = ''
+  for (let i = 0; i <= 4; i++) {
+    const t = now - total + (total / 4) * i
+    ticks += `<span style="left:${i * 25}%">${i === 4 ? 'Now' : clock(t)}</span>`
+  }
+  $('#ticks').innerHTML = ticks
+}
+
+// ---------- selection ----------
+async function selectBot (id, push = true) {
+  if (state.dirty && state.selected !== id && !confirm('You have unsaved bot settings. Leave without saving?')) return
+  if (state.macroEdit && state.selected !== id && !confirm('You have an unsaved macro. Leave it?')) return
+  if (state.selected !== id) state.macroEdit = null
+  state.dirty = false
+  state.view = 'bot'
+  state.selected = id
+  localStorage.setItem('golemafk.selected', id)
+  $('#app').classList.toggle('show-bot', push)
+  render()
+  renderSettings()
+  $('#console').innerHTML = '<p class="note">Loading chat...</p>'
+  try {
+    const data = await api('GET', `/api/bots/${id}/log`)
+    state.logs.set(id, data.log)
+    state.history.set(id, data.history)
+    if (state.selected !== id) return
+    renderConsole()
+    render()
+  } catch (e) { $('#console').innerHTML = `<p class="note">${esc(e.message)}</p>` }
+}
+
+$('#roster').addEventListener('click', async e => {
+  const row = e.target.closest('.roster-row')
+  if (row) return selectBot(row.dataset.id)
+  const all = e.target.closest('[data-all]')
+  if (all) {
+    await api('POST', `/api/all/${all.dataset.all}`).catch(err => toast(err.message))
+    toast(all.dataset.all === 'start' ? 'Starting every stopped bot.' : 'Stopping every bot.')
+  }
+})
+$('#backBtn').addEventListener('click', () => $('#app').classList.remove('show-bot'))
+$('#brand').addEventListener('click', e => { e.preventDefault(); $('#app').classList.remove('show-bot') })
+
+$('#botActions').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-act]')
+  if (!btn) return
+  btn.disabled = true
+  try { await api('POST', `/api/bots/${state.selected}/${btn.dataset.act}`) } catch (err) { toast(err.message) }
+  btn.disabled = false
+})
+
+const onThisPC = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)
+async function openSignin (id, auto) {
+  try {
+    state.signinState[id] = 'Sign-in window open on the PC. Choose an account there.'
+    renderSigninState()
+    await api('POST', `/api/bots/${id}/choose-account`)
+  } catch (err) {
+    state.signinState[id] = err.message
+    renderSigninState()
+    if (!auto) toast(err.message)
+  }
+}
+function renderSigninState () {
+  const el = $('#signinState')
+  if (el) el.textContent = state.signinState[state.selected] || ''
+}
+$('#signinOpen').addEventListener('click', () => openSignin(state.selected))
+$('#copyCode').addEventListener('click', async () => {
+  const code = $('#signinCode').textContent
+  try { await navigator.clipboard.writeText(code); toast('Code copied.') } catch { toast(`The code is ${code}`) }
+})
+
+// ---------- console ----------
+const MC = { 0: '#6B6F75', 1: '#5B6FE0', 2: '#3FBF3F', 3: '#3FBFBF', 4: '#D04040', 5: '#BF3FBF', 6: '#F0A800', 7: '#B4B6B0', 8: '#8A8E94', 9: '#7C7CFF', a: '#6EF06E', b: '#6EF0F0', c: '#FF6B6B', d: '#FF77FF', e: '#FFF36B', f: '#F4F4F0' }
+function motdHTML (s) {
+  let out = ''
+  let style = { color: null, b: false, i: false, u: false, m: false }
+  const parts = String(s).split(/(§#[0-9a-fA-F]{6}|§[0-9a-fk-orA-FK-OR])/)
+  for (const p of parts) {
+    if (!p) continue
+    if (p.startsWith('§#')) { style = { color: p.slice(1), b: false, i: false, u: false, m: false }; continue }
+    if (p.length === 2 && p[0] === '§') {
+      const c = p[1].toLowerCase()
+      if (MC[c]) style = { color: MC[c], b: false, i: false, u: false, m: false }
+      else if (c === 'l') style.b = true
+      else if (c === 'o') style.i = true
+      else if (c === 'n') style.u = true
+      else if (c === 'm') style.m = true
+      else if (c === 'r') style = { color: null, b: false, i: false, u: false, m: false }
+      continue
+    }
+    const css = []
+    if (style.color) css.push(`color:${style.color}`)
+    if (style.b) css.push('font-weight:700')
+    if (style.i) css.push('font-style:italic')
+    if (style.u || style.m) css.push(`text-decoration:${style.u ? 'underline' : ''} ${style.m ? 'line-through' : ''}`)
+    out += css.length ? `<span style="${css.join(';')}">${esc(p)}</span>` : esc(p)
+  }
+  return out
+}
+function whoHTML (l) {
+  if (l.from) {
+    const me = l.kind === 'you'
+    const initial = esc(l.from[0].toUpperCase())
+    return `<span class="who${me ? ' me' : ''}"><img src="https://mc-heads.net/avatar/${encodeURIComponent(l.from)}/16" alt="" loading="lazy" onerror="this.outerHTML='<i>${initial}</i>'">${esc(l.from)}</span>`
+  }
+  if (l.kind === 'server') return '<span class="who sys">Server</span>'
+  return ''
+}
+function lineHTML (l) {
+  const body = l.motd ? motdHTML(l.motd) : esc(l.text)
+  return `<div class="line ${l.kind}"><time>${clock(l.t)}</time><span class="text">${whoHTML(l)}${body}</span></div>`
+}
+function renderConsole () {
+  const log = state.logs.get(state.selected) || []
+  const c = $('#console')
+  c.innerHTML = log.length ? log.map(lineHTML).join('') : '<p class="note">Nothing yet. Chat and events show up here once the bot starts.</p>'
+  c.scrollTop = c.scrollHeight
+}
+function appendLine (l) {
+  const c = $('#console')
+  const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 40
+  const note = c.querySelector('.note')
+  if (note) note.remove()
+  c.insertAdjacentHTML('beforeend', lineHTML(l))
+  while (c.children.length > 100) c.firstElementChild.remove()
+  if (atBottom) c.scrollTop = c.scrollHeight
+}
+
+$('#sayForm').addEventListener('submit', async e => {
+  e.preventDefault()
+  const input = $('#sayInput')
+  const text = input.value.trim()
+  if (!text) return
+  try {
+    await api('POST', `/api/bots/${state.selected}/say`, { text })
+    state.sent.push(text)
+    state.sentAt = -1
+    input.value = ''
+  } catch (err) { toast(err.message) }
+})
+$('#sayInput').addEventListener('keydown', e => {
+  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
+  if (!state.sent.length) return
+  e.preventDefault()
+  if (state.sentAt < 0) state.sentAt = state.sent.length
+  state.sentAt = Math.max(0, Math.min(state.sent.length, state.sentAt + (e.key === 'ArrowUp' ? -1 : 1)))
+  e.target.value = state.sent[state.sentAt] || ''
+})
+
+// ---------- tabs ----------
+function showTab (tab) {
+  if (tab === 'chat' && state.dirty && !confirm('You have unsaved bot settings. Leave them unsaved?')) return
+  if (tab === 'chat' && state.dirty) { state.dirty = false; renderSettings() }
+  if (tab !== 'macros' && state.macroEdit && !confirm('You have an unsaved macro. Leave it?')) return
+  if (tab !== 'macros') state.macroEdit = null
+  state.tab = tab
+  $('#tabChat').setAttribute('aria-selected', tab === 'chat')
+  $('#tabMacros').setAttribute('aria-selected', tab === 'macros')
+  $('#tabSettings').setAttribute('aria-selected', tab === 'settings')
+  $('#paneChat').hidden = tab !== 'chat'
+  $('#paneMacros').hidden = tab !== 'macros'
+  $('#paneSettings').hidden = tab !== 'settings'
+  if (tab === 'macros') renderMacros()
+  if (tab === 'chat') { const c = $('#console'); c.scrollTop = c.scrollHeight }
+}
+$('#tabChat').addEventListener('click', () => showTab('chat'))
+$('#tabSettings').addEventListener('click', () => showTab('settings'))
+$('#tabMacros').addEventListener('click', () => showTab('macros'))
+
+
+// ---------- macros ----------
+const STEPS = {
+  move: ['Move to', 'Walks there and goes around blocks. Leave Y empty for any height.'],
+  wait: ['Wait', ''],
+  chat: ['Say or run a command', ''],
+  look: ['Look', ''],
+  slot: ['Hold hotbar slot', ''],
+  use: ['Right-click held item', 'Like eating, or opening a server-picker compass.'],
+  useBlock: ['Right-click block in front', 'Opens chests and doors, presses buttons.'],
+  click: ['Click menu item', 'Clicks the item with this name in the open menu.'],
+  close: ['Close menu', ''],
+  jump: ['Jump', ''],
+  sneak: ['Sneak', ''],
+  attack: ['Hit nearest mob', 'Hits a mob within reach, if there is one.']
+}
+const BEDROCK_STEPS = ['chat', 'wait']
+function newStep (type) {
+  const b = state.bots.get(state.selected)
+  const s = (b && b.stats) || {}
+  switch (type) {
+    case 'move': return { type, x: s.x ?? '', y: s.y ?? '', z: s.z ?? '' }
+    case 'wait': return { type, seconds: 5 }
+    case 'sneak': return { type, seconds: 2 }
+    case 'chat': return { type, text: '' }
+    case 'look': return { type, dir: 'north' }
+    case 'slot': return { type, slot: 1 }
+    case 'click': return { type, name: '' }
+    default: return { type }
+  }
+}
+function stepSummary (st) {
+  switch (st.type) {
+    case 'move': return `Move to ${st.x}, ${st.y === '' ? 'any height' : st.y}, ${st.z}`
+    case 'wait': return `Wait ${st.seconds} s`
+    case 'chat': return `Say "${st.text}"`
+    case 'look': return `Look ${st.dir}`
+    case 'slot': return `Hold slot ${st.slot}`
+    case 'click': return `Click "${st.name}"`
+    case 'sneak': return `Sneak ${st.seconds} s`
+    default: return STEPS[st.type][0]
+  }
+}
+
+function renderMacros () {
+  const b = state.bots.get(state.selected)
+  const pane = $('#paneMacros')
+  if (!b) { pane.innerHTML = ''; return }
+  if (state.macroEdit) return renderMacroEditor(b)
+  const list = b.cfg.macros || []
+  const running = b.macro
+  const rows = list.map(m => {
+    const on = running && running.id === m.id
+    const extra = [`${m.steps.length} step${m.steps.length === 1 ? '' : 's'}`]
+    if (m.loop) extra.push('repeats forever')
+    if (m.onJoin) extra.push('starts when the bot joins')
+    const line = on ? `Running: step ${running.step + 1} of ${m.steps.length}, ${stepSummary(m.steps[running.step] || { type: 'wait', seconds: 0 })}` : extra.join(', ')
+    return `<div class="macro-row${on ? ' running' : ''}">
+      <strong>${esc(m.name)}</strong>
+      <small>${esc(line)}</small>
+      <div class="row-actions">
+        <button type="button" class="btn" data-medit="${m.id}">Edit</button>
+        ${on
+          ? `<button type="button" class="btn" data-mstop><svg><use href="#i-stop"/></svg><span>Stop</span></button>`
+          : `<button type="button" class="btn primary" data-mplay="${m.id}" ${b.status !== 'online' ? 'disabled title="Start the bot first"' : ''}><svg><use href="#i-play"/></svg><span>Play</span></button>`}
+      </div>
+    </div>`
+  }).join('')
+  pane.innerHTML = `
+    <p class="intro">A macro is a list of steps the bot does in order, like walking somewhere and then typing a command. Press Play to run one.</p>
+    ${rows || '<p class="macro-empty">No macros yet.</p>'}
+    <button type="button" class="btn" data-mnew><svg><use href="#i-plus"/></svg><span>New macro</span></button>`
+}
+
+function renderMacroEditor (b) {
+  const d = state.macroEdit.draft
+  const bedrock = b.edition === 'bedrock'
+  const allowed = Object.keys(STEPS).filter(k => !bedrock || BEDROCK_STEPS.includes(k))
+  const steps = d.steps.map((st, i) => `<li class="step" data-i="${i}">
+      <div class="step-body"><b>${esc(STEPS[st.type][0])}</b>${stepFields(st, i)}${STEPS[st.type][1] ? `<span class="hint">${esc(STEPS[st.type][1])}</span>` : ''}</div>
+      <div class="step-tools">
+        <button type="button" class="btn icon" data-sup="${i}" aria-label="Move step ${i + 1} up" ${i === 0 ? 'disabled' : ''}><svg><use href="#i-up"/></svg></button>
+        <button type="button" class="btn icon" data-sdown="${i}" aria-label="Move step ${i + 1} down" ${i === d.steps.length - 1 ? 'disabled' : ''}><svg><use href="#i-down"/></svg></button>
+        <button type="button" class="btn icon" data-sdel="${i}" aria-label="Remove step ${i + 1}"><svg><use href="#i-close"/></svg></button>
+      </div>
+    </li>`).join('')
+  $('#paneMacros').innerHTML = `
+    ${bedrock ? '<p class="note-box">Bedrock bots can only use "Say or run a command" and "Wait" steps.</p>' : ''}
+    <label class="field"><span>Macro name</span><input id="mName" value="${esc(d.name)}" maxlength="40" autocomplete="off"></label>
+    ${d.steps.length ? `<ol class="steps">${steps}</ol>` : '<p class="macro-empty">No steps yet. Pick one below and press Add step.</p>'}
+    <div class="add-step">
+      <select id="mAddType" aria-label="Step to add">${allowed.map(k => `<option value="${k}">${esc(STEPS[k][0])}</option>`).join('')}</select>
+      <button type="button" class="btn" data-sadd><svg><use href="#i-plus"/></svg><span>Add step</span></button>
+    </div>
+    <div class="macro-opts">
+      <label class="switch"><input type="checkbox" id="mLoop" ${d.loop ? 'checked' : ''}><span>When it reaches the last step, start again from the top</span></label>
+      <label class="switch"><input type="checkbox" id="mJoin" ${d.onJoin ? 'checked' : ''}><span>Play it by itself every time the bot joins the server</span></label>
+    </div>
+    <div class="macro-foot">
+      ${state.macroEdit.isNew ? '' : '<button type="button" class="btn subtle danger" data-mdel>Delete macro</button>'}
+      <span class="grow"></span>
+      <button type="button" class="btn" data-mcancel>Cancel</button>
+      <button type="button" class="btn primary" data-msave>Save macro</button>
+    </div>`
+}
+
+function stepFields (st, i) {
+  const f = (k, attrs) => `data-i="${i}" data-k="${k}" ${attrs}`
+  switch (st.type) {
+    case 'move': return `<div class="step-fields">
+        <input class="xyz" type="number" step="1" ${f('x', `value="${esc(st.x)}" placeholder="X" aria-label="X"`)}>
+        <input class="xyz" type="number" step="1" ${f('y', `value="${esc(st.y)}" placeholder="Y (any)" aria-label="Y, optional"`)}>
+        <input class="xyz" type="number" step="1" ${f('z', `value="${esc(st.z)}" placeholder="Z" aria-label="Z"`)}>
+        <button type="button" class="btn" data-shere="${i}"><svg><use href="#i-pin"/></svg><span>Use the bot's spot</span></button>
+      </div>`
+    case 'wait': case 'sneak': return `<div class="step-fields"><input class="xyz" type="number" min="0.1" max="3600" step="0.5" ${f('seconds', `value="${esc(st.seconds)}" aria-label="Seconds"`)}><span>seconds</span></div>`
+    case 'chat': return `<div class="step-fields"><input class="wide" maxlength="256" ${f('text', `value="${esc(st.text)}" placeholder="/home 1 or a message" aria-label="Message or command"`)}></div>`
+    case 'look': return `<div class="step-fields"><select ${f('dir', 'aria-label="Direction"')}>${['north', 'east', 'south', 'west', 'up', 'down'].map(d => `<option value="${d}" ${st.dir === d ? 'selected' : ''}>${d[0].toUpperCase() + d.slice(1)}</option>`).join('')}</select></div>`
+    case 'slot': return `<div class="step-fields"><select ${f('slot', 'aria-label="Hotbar slot"')}>${[1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `<option value="${n}" ${Number(st.slot) === n ? 'selected' : ''}>Slot ${n}</option>`).join('')}</select></div>`
+    case 'click': return `<div class="step-fields"><input class="wide" maxlength="60" ${f('name', `value="${esc(st.name)}" placeholder="Name of the item, e.g. Survival" aria-label="Menu item name"`)}></div>`
+    default: return ''
+  }
+}
+
+function startEdit (macro) {
+  state.macroEdit = { isNew: !macro, draft: macro ? JSON.parse(JSON.stringify(macro)) : { id: Math.random().toString(16).slice(2, 10).padEnd(8, '0'), name: 'New macro', loop: false, onJoin: false, steps: [] } }
+  renderMacros()
+}
+async function saveMacros (list, done) {
+  try {
+    const res = await api('PATCH', `/api/bots/${state.selected}`, { macros: list })
+    state.bots.set(res.bot.cfg.id, res.bot)
+    state.macroEdit = null
+    renderMacros()
+    toast(done)
+  } catch (err) { toast(err.message) }
+}
+
+$('#paneMacros').addEventListener('input', e => {
+  const ed = state.macroEdit
+  if (!ed) return
+  const t = e.target
+  if (t.id === 'mName') ed.draft.name = t.value
+  if (t.id === 'mLoop') ed.draft.loop = t.checked
+  if (t.id === 'mJoin') ed.draft.onJoin = t.checked
+  if (t.dataset.k) ed.draft.steps[Number(t.dataset.i)][t.dataset.k] = t.value
+})
+$('#paneMacros').addEventListener('change', e => {
+  const ed = state.macroEdit
+  if (ed && e.target.dataset.k) ed.draft.steps[Number(e.target.dataset.i)][e.target.dataset.k] = e.target.value
+})
+$('#paneMacros').addEventListener('click', async e => {
+  const el = e.target.closest('button')
+  if (!el) return
+  const b = state.bots.get(state.selected)
+  const ed = state.macroEdit
+  const d = el.dataset
+  if (d.mnew !== undefined) return startEdit(null)
+  if (d.medit) return startEdit((b.cfg.macros || []).find(m => m.id === d.medit))
+  if (d.mplay) {
+    try { await api('POST', `/api/bots/${state.selected}/play`, { macro: d.mplay }) } catch (err) { toast(err.message) }
+    return
+  }
+  if (d.mstop !== undefined) { await api('POST', `/api/bots/${state.selected}/stopmacro`).catch(err => toast(err.message)); return }
+  if (!ed) return
+  const steps = ed.draft.steps
+  if (d.sadd !== undefined) {
+    steps.push(newStep($('#mAddType').value))
+    renderMacros()
+    const last = $('#paneMacros .step:last-child input, #paneMacros .step:last-child select')
+    if (last) last.focus()
+    return
+  }
+  if (d.sup) { const i = Number(d.sup); [steps[i - 1], steps[i]] = [steps[i], steps[i - 1]]; return renderMacros() }
+  if (d.sdown) { const i = Number(d.sdown); [steps[i + 1], steps[i]] = [steps[i], steps[i + 1]]; return renderMacros() }
+  if (d.sdel) { steps.splice(Number(d.sdel), 1); return renderMacros() }
+  if (d.shere) {
+    const s = b.stats || {}
+    if (b.status !== 'online' || s.x === undefined) return toast('The bot has to be online to use its spot.')
+    Object.assign(steps[Number(d.shere)], { x: s.x, y: s.y, z: s.z })
+    return renderMacros()
+  }
+  if (d.mcancel !== undefined) { state.macroEdit = null; return renderMacros() }
+  if (d.mdel !== undefined) {
+    if (!confirm(`Delete the macro "${ed.draft.name}"?`)) return
+    return saveMacros((b.cfg.macros || []).filter(m => m.id !== ed.draft.id), 'Macro deleted.')
+  }
+  if (d.msave !== undefined) {
+    const bad = steps.find(st => st.type === 'move' && (st.x === '' || st.z === ''))
+    if (bad) return toast('Every Move to step needs an X and a Z.')
+    const list = (b.cfg.macros || []).slice()
+    const at = list.findIndex(m => m.id === ed.draft.id)
+    if (at >= 0) list[at] = ed.draft
+    else list.push(ed.draft)
+    return saveMacros(list, 'Macro saved.')
+  }
+})
+
+// ---------- bot settings ----------
+const AFK_ACTIONS = [['look', 'Look around'], ['swing', 'Swing arm'], ['jump', 'Jump'], ['sneak', 'Sneak'], ['step', 'Step forward and back']]
+function renderSettings () {
+  const b = state.bots.get(state.selected)
+  const f = $('#paneSettings')
+  if (!b) { f.innerHTML = ''; return }
+  const c = b.cfg
+  const bedrock = b.edition === 'bedrock'
+  const versions = ['auto', ...state.versions].map(v => `<option value="${v}" ${v === c.version ? 'selected' : ''}>${v === 'auto' ? 'Match the server (recommended)' : v}</option>`).join('')
+  f.innerHTML = `
+    <section class="group">
+      <h3>Connection</h3>
+      <div class="three">
+        <label class="field"><span>Server address</span><input name="host" value="${esc(c.host)}" required spellcheck="false" autocomplete="off"></label>
+        <label class="field"><span>Port</span><input name="port" type="number" min="1" max="65535" value="${esc(c.port)}"></label>
+        <label class="field"><span>Name on the dashboard</span><input name="label" value="${esc(c.label)}" maxlength="40" autocomplete="off"></label>
+      </div>
+      ${bedrock
+        ? '<p class="hint" style="margin-bottom:16px">Bedrock bot. The version is picked automatically, and Donut\'s Bedrock port is 19132.</p>'
+        : `<label class="field"><span>Minecraft version</span><select name="version">${versions}</select></label>`}
+      <fieldset class="field">
+        <legend>Account</legend>
+        <div class="segmented">
+          <label><input type="radio" name="auth" value="microsoft" ${c.auth === 'microsoft' ? 'checked' : ''}><span>Microsoft account</span></label>
+          <label><input type="radio" name="auth" value="offline" ${c.auth === 'offline' ? 'checked' : ''}><span>Offline name</span></label>
+        </div>
+      </fieldset>
+      <div class="account" data-show="microsoft" ${c.auth !== 'microsoft' ? 'hidden' : ''}>
+        <span>${c.account ? `Signed in as <strong>${esc(c.account)}</strong>.` : "Not signed in yet. You'll get a code when the bot starts."}</span>
+        <button type="button" class="btn" id="switchAcct">${c.account ? 'Use a different account' : 'Choose account'}</button>
+        ${c.account ? '<button type="button" class="btn subtle" id="forgetBtn">Sign out</button>' : ''}
+      </div>
+      <label class="field" data-show="offline" ${c.auth !== 'offline' ? 'hidden' : ''}><span>Player name (only works on offline-mode servers)</span><input name="name" value="${esc(c.name)}" maxlength="16" pattern="${bedrock ? '[A-Za-z0-9_ ]{3,16}' : '[A-Za-z0-9_]{3,16}'}" autocomplete="off" spellcheck="false"></label>
+    </section>
+
+    <section class="group">
+      <h3>When it joins</h3>
+      <p class="hint">Runs once each time the bot gets into the server, one line at a time.</p>
+      <label class="field"><span>Commands</span><textarea name="joinCommands" spellcheck="false" placeholder="/home 1">${esc(c.joinCommands)}</textarea></label>
+      <ul class="cmd-help">
+        <li><code>/home 1</code> or any text: sends it in chat</li>
+        <li><code>wait 5</code>: waits 5 seconds</li>
+        <li><code>slot 1</code>: holds hotbar slot 1</li>
+        <li><code>use</code>: right-clicks the held item, like a server-picker compass</li>
+        <li><code>click Survival</code>: clicks the menu item with that name</li>
+        <li><code>close</code>: closes the open menu</li>
+      </ul>
+    </section>
+
+    <section class="group">
+      <h3>Repeat every few minutes</h3>
+      <label class="switch"><input type="checkbox" name="repeat.on" ${c.repeat.on ? 'checked' : ''}><span>Run these commands again and again while online</span></label>
+      <div class="two">
+        <label class="field"><span>Every (minutes)</span><input name="repeat.every" type="number" min="0.5" max="1440" step="0.5" value="${esc(c.repeat.every)}"></label>
+      </div>
+      <label class="field"><span>Commands</span><textarea name="repeat.commands" spellcheck="false" placeholder="/sell">${esc(c.repeat.commands)}</textarea></label>
+    </section>
+
+    <section class="group">
+      <h3>Look busy</h3>
+      <p class="hint">Small random actions so the server doesn't kick the bot for being AFK.</p>
+      <label class="switch"><input type="checkbox" name="antiAfk.on" ${c.antiAfk.on ? 'checked' : ''}><span>Do something every so often</span></label>
+      <div class="two"><label class="field"><span>About every (seconds)</span><input name="antiAfk.every" type="number" min="5" max="600" value="${esc(c.antiAfk.every)}"></label></div>
+      <div class="checks" ${bedrock ? 'hidden' : ''}>${AFK_ACTIONS.map(([k, t]) => `<label><input type="checkbox" name="afk:${k}" ${c.antiAfk.actions.includes(k) ? 'checked' : ''}> ${t}</label>`).join('')}</div>
+    </section>
+
+    <section class="group">
+      <h3>Staying online</h3>
+      <label class="switch"><input type="checkbox" name="reconnect.on" ${c.reconnect.on ? 'checked' : ''}><span>Reconnect when kicked or disconnected</span></label>
+      <div class="two">
+        <label class="field"><span>First wait (seconds, doubles each failed try up to 5 min)</span><input name="reconnect.delay" type="number" min="5" max="300" value="${esc(c.reconnect.delay)}"></label>
+        <label class="field"><span>If I log in on this account myself</span>
+          <select name="reconnect.onDuplicate">
+            <option value="wait" ${c.reconnect.onDuplicate === 'wait' ? 'selected' : ''}>Pause until I press Start</option>
+            <option value="later" ${c.reconnect.onDuplicate === 'later' ? 'selected' : ''}>Try again after 30 minutes</option>
+          </select>
+        </label>
+      </div>
+      <label class="switch" ${bedrock ? 'hidden' : ''}><input type="checkbox" name="autoEat" ${c.autoEat ? 'checked' : ''}><span>Eat food from the inventory when hungry</span></label>
+      <label class="switch"><input type="checkbox" name="alerts" ${c.alerts ? 'checked' : ''}><span>Send Discord alerts for this bot</span></label>
+    </section>
+
+    <div class="save-bar">
+      <button type="button" class="btn subtle danger" id="removeBtn">Remove bot</button>
+      <span class="grow"></span>
+      <p id="dirtyNote"></p>
+      <button class="btn primary" id="saveBot">Save changes</button>
+    </div>`
+}
+
+function readSettings (f) {
+  const v = n => f.elements[n]
+  const out = {
+    host: v('host').value, port: v('port').value, label: v('label').value, version: v('version') ? v('version').value : 'auto',
+    auth: f.querySelector('input[name=auth]:checked').value, name: v('name').value,
+    joinCommands: v('joinCommands').value,
+    repeat: { on: v('repeat.on').checked, every: v('repeat.every').value, commands: v('repeat.commands').value },
+    antiAfk: { on: v('antiAfk.on').checked, every: v('antiAfk.every').value, actions: AFK_ACTIONS.map(a => a[0]).filter(k => v('afk:' + k).checked) },
+    reconnect: { on: v('reconnect.on').checked, delay: v('reconnect.delay').value, onDuplicate: v('reconnect.onDuplicate').value },
+    autoEat: v('autoEat').checked,
+    alerts: v('alerts').checked
+  }
+  return out
+}
+
+$('#paneSettings').addEventListener('input', e => {
+  state.dirty = true
+  $('#dirtyNote').textContent = 'Unsaved changes'
+  if (e.target.name === 'auth') {
+    for (const el of $('#paneSettings').querySelectorAll('[data-show]')) el.hidden = el.dataset.show !== e.target.value
+  }
+})
+$('#paneSettings').addEventListener('submit', async e => {
+  e.preventDefault()
+  const f = e.currentTarget
+  const data = readSettings(f)
+  const isBedrock = (state.bots.get(state.selected) || {}).edition === 'bedrock'
+  if (data.auth === 'offline' && !(isBedrock ? /^[A-Za-z0-9_ ]{3,16}$/ : /^[A-Za-z0-9_]{3,16}$/).test(data.name)) return toast('Offline names need 3 to 16 letters, numbers or underscores.')
+  try {
+    const res = await api('PATCH', `/api/bots/${state.selected}`, data)
+    state.bots.set(res.bot.cfg.id, res.bot)
+    state.dirty = false
+    renderSettings()
+    render()
+    if (res.needsRestart) {
+      if (confirm('Saved. Restart the bot now to use the new connection settings?')) await api('POST', `/api/bots/${state.selected}/restart`)
+    } else toast('Saved. Changes apply the next time the bot joins.')
+  } catch (err) { toast(err.message) }
+})
+$('#paneSettings').addEventListener('click', async e => {
+  if (e.target.closest('#removeBtn')) {
+    const b = state.bots.get(state.selected)
+    if (!confirm(`Remove ${nameOf(b)}? It disconnects, and its saved sign-in and chat log are deleted.`)) return
+    state.dirty = false
+    await api('DELETE', `/api/bots/${state.selected}`).catch(err => toast(err.message))
+    toast('Bot removed.')
+  }
+  if (e.target.closest('#switchAcct')) {
+    openSignin(state.selected)
+    toast('Choose the Microsoft account in the window that opens on the PC.')
+    return
+  }
+  if (e.target.closest('#forgetBtn')) {
+    if (!confirm('Sign this bot out of its Microsoft account? It stops, and asks for a new code next time it starts.')) return
+    await api('POST', `/api/bots/${state.selected}/forget`).catch(err => toast(err.message))
+    toast('Signed out. Start the bot to sign in again.')
+  }
+})
+
+// ---------- add bot ----------
+function openAdd () {
+  const f = $('#addForm')
+  f.reset()
+  $('#addError').textContent = ''
+  $('#offlineName').hidden = true
+  $('#editionHint').textContent = 'The normal PC version. Everything works, including walking in macros.'
+  $('#authHint').textContent = "You'll get a code to sign in once the bot starts."
+  $('#addDialog').showModal()
+}
+$('#addBtn').addEventListener('click', openAdd)
+$('#emptyAdd').addEventListener('click', openAdd)
+$('#addForm').addEventListener('change', e => {
+  if (e.target.name === 'edition') {
+    $('#editionHint').textContent = e.target.value === 'bedrock'
+      ? 'For Xbox, phone and Windows 10/11 Bedrock accounts. Joins the server\'s Bedrock port (Donut: 19132). Chat, commands, screenshots and staying online work; walking is Java only.'
+      : 'The normal PC version. Everything works, including walking in macros.'
+    $('#offlineName input').pattern = e.target.value === 'bedrock' ? '[A-Za-z0-9_ ]{3,16}' : '[A-Za-z0-9_]{3,16}'
+    return
+  }
+  if (e.target.name !== 'auth') return
+  const off = e.target.value === 'offline'
+  $('#offlineName').hidden = !off
+  $('#offlineName input').required = off
+  $('#authHint').textContent = off ? 'Only works on cracked (offline-mode) servers.' : "You'll get a code to sign in once the bot starts."
+})
+$('#addForm').addEventListener('submit', async e => {
+  e.preventDefault()
+  const f = e.currentTarget
+  const el = f.elements
+  const body = { edition: el.edition.value, host: el.host.value, auth: el.auth.value, name: el.name.value, label: el.label.value, start: true }
+  try {
+    const res = await api('POST', '/api/bots', body)
+    state.bots.set(res.bot.cfg.id, res.bot)
+    if (body.auth === 'microsoft') state.autoSignin = res.bot.cfg.id
+    $('#addDialog').close()
+    selectBot(res.bot.cfg.id)
+    showTab('chat')
+  } catch (err) { $('#addError').textContent = err.message }
+})
+
+// ---------- app settings ----------
+async function openSettings () {
+  const data = await api('GET', '/api/settings')
+  const s = data.settings
+  const f = $('#setForm')
+  f.webhookUrl.value = s.webhookUrl
+  for (const k of Object.keys(s.alerts)) if (f['a_' + k]) f['a_' + k].checked = s.alerts[k]
+  f.lowHealth.value = String(s.lowHealth)
+  if (!f.lowHealth.value) f.lowHealth.value = '6'
+  f.keywords.value = s.keywords
+  f.screenshotEvery.value = String(s.screenshotEvery)
+  f.allowPhone.checked = s.allowPhone
+  f.startWithWindows.checked = s.startWithWindows
+  $('#startupRow').hidden = !data.windows
+  f.port.value = s.port
+  f.password.value = ''
+  $('#lanHint').textContent = data.lan.length
+    ? `On your phone, open ${data.lan.map(ip => `http://${ip}:${s.port}`).join(' or ')}. Windows may ask to let Node.js through the firewall; allow it on private networks.`
+    : 'No Wi-Fi or network address found on this computer.'
+  $('#setError').textContent = ''
+  api('GET', '/api/update').then(u => { state.update = u; renderUpdate() }).catch(() => {})
+  $('#testResult').textContent = ''
+  $('#setDialog').showModal()
+}
+$('#settingsBtn').addEventListener('click', () => openSettings().catch(e => toast(e.message)))
+$('#setForm').addEventListener('submit', async e => {
+  e.preventDefault()
+  const f = e.currentTarget
+  const alerts = {}
+  for (const el of f.querySelectorAll('input[name^="a_"]')) alerts[el.name.slice(2)] = el.checked
+  const body = {
+    webhookUrl: f.webhookUrl.value, alerts, lowHealth: f.lowHealth.value, keywords: f.keywords.value, screenshotEvery: f.screenshotEvery.value,
+    allowPhone: f.allowPhone.checked, port: f.port.value
+  }
+  if (!$('#startupRow').hidden) body.startWithWindows = f.startWithWindows.checked
+  if (f.password.value) body.password = f.password.value
+  try {
+    const before = await api('GET', '/api/settings')
+    await api('PATCH', '/api/settings', body)
+    $('#setDialog').close()
+    const restartNeeded = before.settings.port !== Number(body.port) || before.settings.allowPhone !== body.allowPhone
+    toast(restartNeeded ? 'Saved. Close and reopen Golem AFK to use the new port or phone setting.' : before.settings.screenshotEvery !== Number(body.screenshotEvery) ? 'Saved. The new screenshot timing starts the next time each bot joins.' : 'Settings saved.')
+  } catch (err) { $('#setError').textContent = err.message }
+})
+$('#testAlert').addEventListener('click', async () => {
+  $('#testResult').textContent = 'Sending...'
+  const res = await api('POST', '/api/settings/test-alert', { url: $('#setForm').webhookUrl.value }).catch(e => ({ ok: false, error: e.message }))
+  $('#testResult').textContent = res.ok ? 'Sent. Check your Discord channel.' : res.error
+})
+$('#signOut').addEventListener('click', async () => {
+  await api('POST', '/api/logout').catch(() => {})
+  $('#setDialog').close()
+  if (ws) { ws.onclose = null; ws.close() }
+  showGate(false)
+})
+$('#quitApp').addEventListener('click', async () => {
+  if (!confirm('Quit Golem AFK? Every bot disconnects until you open the app again.')) return
+  await api('POST', '/api/quit').catch(() => {})
+  $('#setDialog').close()
+  document.body.innerHTML = '<main class="gate"><div class="gate-plate"><h1>Golem AFK is closed</h1><p>Open it again with Start Golem AFK on your computer.</p></div></main>'
+})
+
+
+// ---------- updates ----------
+function renderUpdate () {
+  const u = state.update
+  if (!u) return
+  const busy = ['downloading', 'installing', 'restarting'].includes(u.status)
+  $('#updatePill').hidden = u.status !== 'available'
+  $('#updatePill span').textContent = u.latest ? `Update to ${u.latest}` : 'Update ready'
+  const lines = [`You have version ${u.current}.`]
+  if (u.detail) lines.push(u.detail)
+  $('#updText').textContent = lines.join(' ')
+  $('#updBar').hidden = !busy
+  $('#updFill').style.width = `${Math.round((u.status === 'downloading' ? u.progress : 1) * 100)}%`
+  $('#updInstall').hidden = u.status !== 'available'
+  $('#updInstall').textContent = `Install version ${u.latest}`
+  for (const id of ['#updInstall', '#updCheck', '#updZip']) $(id).disabled = busy || u.status === 'checking'
+  if (u.status === 'restarting') showRestarting(u.latest)
+}
+function showRestarting (version) {
+  if (state.restarting) return
+  state.restarting = true
+  toast(`Updated${version && version !== '?' ? ` to ${version}` : ''}. Golem AFK is restarting; this page reloads by itself.`)
+  // the app comes back in a few seconds; reload once it answers with the new version
+  const poll = setInterval(async () => {
+    const s = await fetch('/api/session').then(r => r.json()).catch(() => null)
+    if (s && s.version !== state.version) { clearInterval(poll); location.reload() }
+  }, 2000)
+}
+$('#updatePill').addEventListener('click', () => openSettings().then(() => $('#updates').scrollIntoView({ block: 'start' })).catch(e => toast(e.message)))
+$('#updCheck').addEventListener('click', async () => {
+  try { state.update = await api('POST', '/api/update/check'); renderUpdate() } catch (e) { toast(e.message) }
+})
+$('#updInstall').addEventListener('click', async () => {
+  try { await api('POST', '/api/update/install'); showRestarting(state.update && state.update.latest) } catch (e) { toast(e.message) }
+})
+$('#updZip').addEventListener('click', () => $('#updFile').click())
+$('#updFile').addEventListener('change', () => {
+  const file = $('#updFile').files[0]
+  $('#updFile').value = ''
+  if (!file) return
+  const xhr = new XMLHttpRequest()
+  xhr.open('POST', '/api/update/upload')
+  xhr.setRequestHeader('content-type', 'application/zip')
+  $('#updBar').hidden = false
+  for (const id of ['#updInstall', '#updCheck', '#updZip']) $(id).disabled = true
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return
+    $('#updFill').style.width = `${Math.round(e.loaded / e.total * 100)}%`
+    $('#updText').textContent = `Sending ${file.name} to Golem AFK: ${Math.round(e.loaded / e.total * 100)}%`
+  }
+  xhr.upload.onload = () => { $('#updText').textContent = 'Checking which files changed...' }
+  xhr.onload = () => {
+    let data = {}
+    try { data = JSON.parse(xhr.responseText) } catch {}
+    if (xhr.status >= 200 && xhr.status < 300) {
+      $('#updText').textContent = `Installed ${data.version || 'the update'} (${data.changed} files changed). Restarting...`
+      showRestarting(data.version)
+    } else {
+      $('#updBar').hidden = true
+      for (const id of ['#updCheck', '#updZip']) $(id).disabled = false
+      $('#updText').textContent = data.error || `The update didn't install (${xhr.status}).`
+    }
+  }
+  xhr.onerror = () => { $('#updText').textContent = "Couldn't send the file to Golem AFK." }
+  xhr.send(file)
+})
+
+for (const d of document.querySelectorAll('dialog')) {
+  d.addEventListener('click', e => { if (e.target.closest('[data-close]') || e.target === d) d.close() })
+}
+
+// ---------- timers ----------
+setInterval(() => {
+  if ($('#app').hidden) return
+  const b = state.bots.get(state.selected)
+  if (b && state.view !== 'grid') { renderStatus(b); renderShotCaption(b) }
+  for (const row of document.querySelectorAll('.roster-row')) {
+    const rb = state.bots.get(row.dataset.id)
+    if (rb) row.querySelector('small').textContent = rosterLine(rb)
+  }
+}, 1000)
+setInterval(() => { if (!$('#app').hidden) { renderStrip(); renderRoster(); if (state.view === 'grid') renderGrid() } }, 30000)
+window.addEventListener('beforeunload', e => { if (state.dirty) { e.preventDefault(); e.returnValue = '' } })
+
+boot()

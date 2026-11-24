@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#1C1A24">
+<title>Golem AFK</title>
+<link rel="icon" href="/golem.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><path d="M7 1h2l.4 2 1.3.6 1.7-1.2 1.4 1.4-1.2 1.7.6 1.3 2 .4v2l-2 .4-.6 1.3 1.2 1.7-1.4 1.4-1.7-1.2-1.3.6L9 15H7l-.4-2-1.3-.6-1.7 1.2-1.4-1.4 1.2-1.7L2.8 9.4 1 9V7l2-.4.6-1.3-1.2-1.7 1.4-1.4 1.7 1.2 1.3-.6zm1 4.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M4 2h2v1h2v1h2v1h2v1h2v4h-2v1h-2v1H8v1H6v1H4z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><path d="M3 3h10v10H3z"/></symbol>
+  <symbol id="i-redo" viewBox="0 0 16 16"><path d="M8 2a6 6 0 1 0 6 6h-2a4 4 0 1 1-1.2-2.8L9 7h5V2l-1.8 1.8A6 6 0 0 0 8 2z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 16 16"><path d="M10 2l1.4 1.4L6.8 8l4.6 4.6L10 14 4 8z"/></symbol>
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M1 2l14 6-14 6 2-6zm2.6 5h5.4v2H3.6L3 11.6 11 8 3 4.4z"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 16 16"><path d="M5 2h6l1 2h3v10H1V4h3zm3 3.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm0 2a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z"/></symbol>
+  <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 3l6 6-1.4 1.4L8 5.8l-4.6 4.6L2 9z"/></symbol>
+  <symbol id="i-down" viewBox="0 0 16 16"><path d="M8 13L2 7l1.4-1.4L8 10.2l4.6-4.6L14 7z"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 16 16"><path d="M8 1a5 5 0 0 1 5 5c0 3.5-5 9-5 9S3 9.5 3 6a5 5 0 0 1 5-5zm0 3a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"/></symbol>
+  <symbol id="i-groups" viewBox="0 0 16 16"><path d="M5 2a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5zm6 0a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5zM0 13c0-2.5 2.2-4.5 5-4.5s5 2 5 4.5v1H0zm11-4.5c2.8 0 5 2 5 4.5v1h-4.5v-1c0-1.7-.7-3.2-1.9-4.3.5-.1.9-.2 1.4-.2z"/></symbol>
+  <symbol id="i-close" viewBox="0 0 16 16"><path d="M3.4 2L8 6.6 12.6 2 14 3.4 9.4 8l4.6 4.6-1.4 1.4L8 9.4 3.4 14 2 12.6 6.6 8 2 3.4z"/></symbol>
+  <symbol id="i-shard" viewBox="0 0 16 16"><path d="M11 0l5 5-9 11-6-1-1-6z"/><path d="M11 0l5 5-7 2z" fill="#fff" fill-opacity=".45"/><path d="M1 15l6 1 2-9z" fill="#000" fill-opacity=".25"/></symbol>
+  <symbol id="i-tp" viewBox="0 0 16 16"><path d="M7 1h2v2h2v2h2v2h-2v-.6L9 8.4V15H7V8.4L5 6.4V7H3V5h2V3h2z"/></symbol>
+</svg>
+
+<!-- sign in / first password -->
+<main id="gate" class="gate" hidden>
+  <form class="gate-plate" id="gateForm">
+    <img src="/golem.svg" alt="" class="gate-mark" width="56" height="63">
+    <h1>Golem AFK</h1>
+    <p id="gateText">Sign in to your bots.</p>
+    <label class="field">
+      <span id="gateLabel">Password</span>
+      <input type="password" id="gatePass" autocomplete="current-password" required minlength="6">
+    </label>
+    <p class="form-error" id="gateError" role="alert"></p>
+    <button class="btn primary wide" id="gateBtn">Sign in</button>
+  </form>
+</main>
+
+<!-- dashboard -->
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <a class="brand" href="#" id="brand"><img src="/golem.svg" alt="" width="24" height="27"><span>Golem AFK</span></a>
+    <nav class="pages" role="tablist" aria-label="Pages">
+      <button role="tab" class="page-tab" data-page="bots" aria-selected="true">Bots</button>
+      <button role="tab" class="page-tab" data-page="screens" aria-selected="false">All screens</button>
+      <button role="tab" class="page-tab" data-page="macros" aria-selected="false">Macros</button>
+      <button role="tab" class="page-tab donut" data-page="donut" aria-selected="false">OG Donut</button>
+    </nav>
+    <div class="top-actions">
+      <p class="tally" id="tally"></p>
+      <button class="btn primary" id="updatePill" hidden><svg><use href="#i-down"/></svg><span>Update ready</span></button>
+      <button class="btn" id="groupsBtn"><svg><use href="#i-groups"/></svg><span>Groups</span></button>
+      <button class="btn" id="addBtn"><svg><use href="#i-plus"/></svg><span>Add bot</span></button>
+      <button class="btn icon" id="settingsBtn" aria-label="Settings" title="Settings"><svg><use href="#i-gear"/></svg></button>
+    </div>
+  </header>
+
+  <!-- Bots -->
+  <div class="work page" id="pageBots">
+    <nav class="roster" id="roster" aria-label="Bots"></nav>
+
+    <section class="detail" id="detail" aria-live="polite">
+      <div class="empty" id="empty">
+        <img src="/golem.svg" alt="" width="64" height="72">
+        <h2>No bots yet</h2>
+        <p>Add a bot, sign in with its Microsoft account once, and it stays on the server for as long as this app is open.</p>
+        <button class="btn primary" id="emptyAdd"><svg><use href="#i-plus"/></svg><span>Add your first bot</span></button>
+      </div>
+
+      <div class="bot" id="bot" hidden>
+        <div class="bot-head">
+          <button class="btn icon back" id="backBtn" aria-label="Back to all bots"><svg><use href="#i-back"/></svg></button>
+          <img class="head big" id="botHead" alt="" width="48" height="48">
+          <div class="bot-title">
+            <h2 id="botName"></h2>
+            <p id="botWhere"></p>
+          </div>
+          <div class="bot-actions" id="botActions"></div>
+        </div>
+        <p class="status-line" id="statusLine"></p>
+
+        <div class="signin-box" id="signin" hidden>
+          <div>
+            <h3>Sign in with Microsoft</h3>
+            <p id="signinPC">Press <strong>Choose account</strong>. Microsoft's sign-in window opens with your saved accounts and <em>Sign in with a different account</em>. Pick the one this bot should use; the window closes by itself and the bot joins. You only do this once per bot.</p>
+            <p id="signinRemote" hidden>Press <strong>Choose account</strong> and finish signing in on the PC running Golem AFK, where the window opens.</p>
+            <details class="code-way">
+              <summary>Use a code instead</summary>
+              <p>Open <a id="signinLink" target="_blank" rel="noopener">microsoft.com/link</a> on any device and enter <strong id="signinCode"></strong>. <button type="button" class="btn subtle small" id="copyCode">Copy code</button></p>
+            </details>
+          </div>
+          <div class="code-box">
+            <button class="btn primary" id="signinOpen"><span>Choose account</span></button>
+            <p class="hint" id="signinState" role="status"></p>
+          </div>
+        </div>
+
+        <div class="bot-body">
+          <figure class="screen" id="screen">
+            <div class="screen-frame" id="screenFrame">
+              <img id="screenImg" alt="">
+              <div class="labels" id="screenLabels"></div>
+              <p class="screen-empty" id="screenEmpty"></p>
+            </div>
+            <figcaption>
+              <span id="screenCaption"></span>
+              <button class="btn small" id="shotBtn"><svg><use href="#i-camera"/></svg><span>Take screenshot now</span></button>
+            </figcaption>
+          </figure>
+
+          <aside class="side">
+            <div class="vitals" id="vitals">
+              <div class="bar" id="hearts" aria-label="Health"></div>
+              <div class="bar" id="hunger" aria-label="Hunger"></div>
+            </div>
+            <div class="shard-box" id="shardBox" hidden>
+              <svg aria-hidden="true"><use href="#i-shard"/></svg>
+              <div><strong id="shardNum"></strong><small id="shardRate"></small></div>
+            </div>
+            <dl class="facts" id="facts"></dl>
+            <p class="actionbar" id="actionBar" hidden></p>
+            <div class="job" id="jobBox" hidden></div>
+          </aside>
+        </div>
+
+        <div class="uptime">
+          <div class="uptime-head">
+            <h3>Last 24 hours</h3>
+            <p id="uptimePct"></p>
+          </div>
+          <div class="strip" id="strip"></div>
+          <div class="ticks" id="ticks"></div>
+        </div>
+
+        <div class="tabs">
+          <div role="tablist" class="tab-list">
+            <button role="tab" class="tab" id="tabChat" aria-selected="true">Chat</button>
+            <button role="tab" class="tab" id="tabMacros" aria-selected="false">Macros</button>
+            <button role="tab" class="tab" id="tabSettings" aria-selected="false">Bot settings</button>
+          </div>
+          <button class="btn tp" id="tpBtn" title="Accept the newest teleport request"><svg><use href="#i-tp"/></svg><span>/tpaccept</span></button>
+        </div>
+
+        <div class="pane" id="paneChat">
+          <div class="console" id="console" tabindex="0" aria-label="Chat and events"></div>
+          <form class="say" id="sayForm">
+            <input id="sayInput" maxlength="256" autocomplete="off" placeholder="Type a message or /command" aria-label="Message">
+            <button class="btn primary icon" aria-label="Send"><svg><use href="#i-send"/></svg></button>
+          </form>
+        </div>
+
+        <div class="pane macros" id="paneMacros" hidden></div>
+
+        <form class="pane settings-form" id="paneSettings" hidden></form>
+      </div>
+    </section>
+  </div>
+
+  <!-- All screens -->
+  <section class="page wide-page" id="pageScreens" hidden>
+    <div class="page-head">
+      <div>
+        <h2>All screens</h2>
+        <p>Running bots only. Click one to open it.</p>
+      </div>
+      <div class="total-shards" id="totalShards" hidden>
+        <svg aria-hidden="true"><use href="#i-shard"/></svg>
+        <div>
+          <span>Total shards</span>
+          <strong id="totalShardsNum"></strong>
+          <small id="totalShardsRate"></small>
+          <small id="totalShardsFrom"></small>
+        </div>
+      </div>
+    </div>
+    <div class="shot-grid" id="shotGrid"></div>
+  </section>
+
+  <!-- Macros for every bot -->
+  <section class="page wide-page narrow" id="pageMacros" hidden>
+    <div class="page-head">
+      <div>
+        <h2>Macros for every bot</h2>
+        <p>Make a macro once and play it on all your online bots at the same time. Bedrock bots do the steps they can and skip the rest.</p>
+      </div>
+    </div>
+    <div class="macros" id="macrosPage"></div>
+  </section>
+
+  <!-- OG Donut -->
+  <section class="page wide-page narrow" id="pageDonut" hidden>
+    <div class="page-head">
+      <div>
+        <h2>OG Donut spawner shop</h2>
+        <p>Each bot you pick runs <code>/shop</code>, opens <strong>Shards</strong> and buys the spawner you choose, paying with its own shards.</p>
+      </div>
+    </div>
+    <form class="shop-form" id="donutForm">
+      <div class="buy-row">
+        <label class="field grow"><span>What to buy</span><select id="dMob" name="mob"></select></label>
+        <label class="field amount"><span>How many each bot buys</span><input id="dAmount" name="amount" type="number" min="1" max="1000" step="1" value="1" inputmode="numeric"></label>
+      </div>
+      <div class="quick" role="group" aria-label="Quick amounts">
+        <button type="button" class="chip" data-amt="1">1</button><button type="button" class="chip" data-amt="8">8</button><button type="button" class="chip" data-amt="16">16</button><button type="button" class="chip" data-amt="32">32</button><button type="button" class="chip" data-amt="64">64</button>
+      </div>
+      <p class="cost" id="dCost"></p>
+
+      <div class="pick-head">
+        <h3>Bots that buy</h3>
+        <label class="switch small"><input type="checkbox" id="dAll"><span>All online bots</span></label>
+      </div>
+      <div class="pick" id="dBots"></div>
+
+      <div class="donut-foot">
+        <button type="button" class="btn subtle" id="dPrices">Read prices from the shop</button>
+        <small class="hint" id="dPricesAt"></small>
+        <span class="grow"></span>
+        <button type="button" class="btn danger" id="dStop" hidden><svg><use href="#i-stop"/></svg><span>Stop buying</span></button>
+        <button class="btn primary" id="dBuy"><svg><use href="#i-shard"/></svg><span>Buy</span></button>
+      </div>
+    </form>
+  </section>
+</div>
+
+<!-- add bot -->
+<dialog id="addDialog" class="sheet">
+  <form id="addForm" method="dialog">
+    <header><h2>Add a bot</h2><button type="button" class="btn icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></header>
+    <fieldset class="field">
+      <legend>Minecraft edition</legend>
+      <div class="segmented">
+        <label><input type="radio" name="edition" value="java" checked><span>Java</span></label>
+        <label><input type="radio" name="edition" value="bedrock"><span>Bedrock</span></label>
+      </div>
+      <p class="hint" id="editionHint">The normal PC version. Everything works, including walking in macros.</p>
+    </fieldset>
+    <label class="field"><span>Server address</span><input name="host" value="og-donutsmp.net" required autocomplete="off" spellcheck="false"></label>
+    <fieldset class="field">
+      <legend>Account</legend>
+      <div class="segmented">
+        <label><input type="radio" name="auth" value="microsoft" checked><span>Microsoft account</span></label>
+        <label><input type="radio" name="auth" value="offline"><span>Offline name</span></label>
+      </div>
+      <p class="hint" id="authHint">You'll get a code to sign in once the bot starts.</p>
+    </fieldset>
+    <label class="field" id="offlineName" hidden><span>Player name</span><input name="name" maxlength="16" pattern="[A-Za-z0-9_]{3,16}" autocomplete="off" spellcheck="false"></label>
+    <label class="field"><span>Name on the dashboard <em>(optional)</em></span><input name="label" maxlength="40" placeholder="Shown instead of the account name" autocomplete="off"></label>
+    <label class="field" id="addGroupField" hidden><span>Group</span><select name="group"></select></label>
+    <p class="form-error" id="addError" role="alert"></p>
+    <footer><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" value="add">Add and start</button></footer>
+  </form>
+</dialog>
+
+<!-- groups and proxies -->
+<dialog id="groupDialog" class="sheet wide-sheet">
+  <form id="groupForm" method="dialog">
+    <header><h2>Groups</h2><button type="button" class="btn icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></header>
+    <p class="hint">Groups start and stop together, and a group can have a proxy so all its bots connect through it. A group holds up to 4 bots, and at most 4 bots run through one proxy, or without a proxy. Choose a bot's group in its Bot settings.</p>
+    <p class="lane-note" id="laneNote"></p>
+    <p class="hint">Proxy formats: <code>host:port</code>, <code>host:port:user:pass</code>, <code>socks5://user:pass@host:port</code> or <code>http://host:port</code>. Bedrock bots need a SOCKS5 proxy that supports UDP.</p>
+    <div id="groupRows"></div>
+    <button type="button" class="btn" id="addGroup"><svg><use href="#i-plus"/></svg><span>Add group</span></button>
+    <p class="form-error" id="groupError" role="alert"></p>
+    <footer><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" value="save">Save groups</button></footer>
+  </form>
+</dialog>
+
+<!-- app settings -->
+<dialog id="setDialog" class="sheet wide-sheet">
+  <form id="setForm" method="dialog">
+    <header><h2>Settings</h2><button type="button" class="btn icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></header>
+
+    <section class="group">
+      <h3>Screenshots</h3>
+      <p class="hint">Each bot draws what it sees. Only the newest picture of each bot is kept.</p>
+      <label class="field"><span>Take a screenshot of each bot</span>
+        <select name="screenshotSeconds">
+          <option value="1">Every second</option><option value="10">Every 10 seconds</option><option value="25">Every 25 seconds</option><option value="30">Every 30 seconds</option><option value="45">Every 45 seconds</option>
+          <option value="60">Every minute</option><option value="120">Every 2 minutes</option><option value="300">Every 5 minutes</option><option value="600">Every 10 minutes</option><option value="1500">Every 25 minutes</option><option value="1800">Every 30 minutes</option><option value="2700">Every 45 minutes</option>
+          <option value="0">Only when I ask</option>
+        </select>
+        <small class="hint">Under a minute uses more of your PC with lots of bots. Each bot waits for its last picture to finish before taking the next.</small>
+      </label>
+    </section>
+
+    <section class="group">
+      <h3>Discord alerts</h3>
+      <p class="hint">Paste a webhook link from a Discord channel (Channel settings, Integrations, Webhooks) to get a message when a bot needs you.</p>
+      <div class="inline">
+        <input name="webhookUrl" placeholder="https://discord.com/api/webhooks/..." autocomplete="off" spellcheck="false" aria-label="Discord webhook link">
+        <button type="button" class="btn" id="testAlert">Send a test</button>
+      </div>
+      <p class="hint" id="testResult" role="status"></p>
+      <div class="checks">
+        <label><input type="checkbox" name="a_kicked"> Kicked or paused</label>
+        <label><input type="checkbox" name="a_stopped"> Stopped for good</label>
+        <label><input type="checkbox" name="a_died"> Died</label>
+        <label><input type="checkbox" name="a_lowHealth"> Low health</label>
+        <label><input type="checkbox" name="a_mentioned"> Name or keyword in chat</label>
+        <label><input type="checkbox" name="a_signIn"> Needs a Microsoft sign-in</label>
+        <label><input type="checkbox" name="a_backOnline"> Back online</label>
+      </div>
+      <div class="two">
+        <label class="field"><span>Low health means</span>
+          <select name="lowHealth">
+            <option value="2">1 heart or less</option><option value="4">2 hearts or less</option><option value="6">3 hearts or less</option><option value="10">5 hearts or less</option>
+          </select>
+        </label>
+        <label class="field"><span>Extra chat keywords</span><input name="keywords" placeholder="e.g. tpa, trade" autocomplete="off"></label>
+      </div>
+    </section>
+
+    <section class="group" id="updates">
+      <h3>Updates</h3>
+      <p class="hint" id="updText"></p>
+      <div class="upd-bar" id="updBar" hidden><i id="updFill"></i></div>
+      <div class="inline upd-actions">
+        <button type="button" class="btn primary" id="updInstall" hidden></button>
+        <button type="button" class="btn" id="updCheck">Check for updates</button>
+        <button type="button" class="btn" id="updZip">Install update from a zip</button>
+        <input type="file" id="updFile" accept=".zip,application/zip" hidden>
+      </div>
+    </section>
+
+    <section class="group">
+      <h3>This computer</h3>
+      <label class="switch"><input type="checkbox" name="allowPhone"><span>Open the dashboard from my phone on the same Wi-Fi</span></label>
+      <p class="hint" id="lanHint"></p>
+      <label class="field"><span>Seconds between bots starting</span>
+        <input name="startDelay" type="number" min="1" max="60" step="1">
+        <small class="hint">When Golem AFK opens or you press Start all, bots join one at a time, this many seconds apart (1 to 60).</small>
+      </label>
+      <label class="switch" id="startupRow"><input type="checkbox" name="startWithWindows"><span>Start Golem AFK in the background when Windows starts</span></label>
+      <div class="two">
+        <label class="field"><span>New dashboard password</span><input type="password" name="password" minlength="6" autocomplete="new-password" placeholder="Leave empty to keep it"></label>
+        <label class="field"><span>Dashboard port</span><input name="port" type="number" min="1024" max="65535"></label>
+      </div>
+    </section>
+
+    <p class="form-error" id="setError" role="alert"></p>
+    <footer>
+      <button type="button" class="btn subtle" id="signOut">Sign out</button>
+      <button type="button" class="btn subtle danger" id="quitApp">Quit Golem AFK</button>
+      <span class="grow"></span>
+      <button class="btn primary" value="save">Save settings</button>
+    </footer>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

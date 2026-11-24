@@ -1,0 +1,141 @@
+'use strict'
+// Proxies for bot connections. Java bots: SOCKS5, SOCKS4 or HTTP (CONNECT).
+// Bedrock bots use UDP, so they need a SOCKS5 proxy with UDP support.
+const net = require('net')
+const dgram = require('dgram')
+const dns = require('dns').promises
+const { SocksClient } = require('socks')
+
+// Accepts: host:port | host:port:user:pass | user:pass@host:port | socks5://user:pass@host:port | http://...
+function parseProxy (text) {
+  let s = String(text || '').trim()
+  if (!s) return null
+  let type = 'socks5'
+  const m = /^(socks5h?|socks4a?|socks|https?):\/\//i.exec(s)
+  if (m) {
+    const t = m[1].toLowerCase()
+    type = t.startsWith('socks4') ? 'socks4' : t.startsWith('http') ? 'http' : 'socks5'
+    s = s.slice(m[0].length)
+  }
+  let user = ''
+  let pass = ''
+  let host
+  let port
+  const at = s.lastIndexOf('@')
+  if (at >= 0) {
+    const cred = s.slice(0, at)
+    s = s.slice(at + 1)
+    const c = cred.indexOf(':')
+    user = c >= 0 ? cred.slice(0, c) : cred
+    pass = c >= 0 ? cred.slice(c + 1) : ''
+  }
+  const parts = s.replace(/\/+$/, '').split(':')
+  if (parts.length === 4 && !user) { [host, port, user, pass] = parts } else if (parts.length === 2) { [host, port] = parts } else throw new Error(`"${text}" isn't a proxy address. Use host:port or host:port:user:pass.`)
+  port = Number(port)
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`"${text}" has no valid port.`)
+  return { type, host, port, user: decodeURIComponent(user), pass: decodeURIComponent(pass) }
+}
+
+function describe (p) { return p ? `${p.type.toUpperCase()} ${p.host}:${p.port}` : 'no proxy' }
+
+function socksOptions (p) {
+  return { host: p.host, port: p.port, type: p.type === 'socks4' ? 4 : 5, userId: p.user || undefined, password: p.pass || undefined }
+}
+
+// A TCP connection to host:port through the proxy (for Java bots)
+async function tcpConnect (p, host, port, timeout = 15000) {
+  if (p.type === 'http') return httpConnect(p, host, port, timeout)
+  const { socket } = await SocksClient.createConnection({ proxy: socksOptions(p), command: 'connect', destination: { host, port }, timeout })
+  return socket
+}
+
+function httpConnect (p, host, port, timeout) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(p.port, p.host)
+    const timer = setTimeout(() => { sock.destroy(); reject(new Error('The proxy did not answer in time.')) }, timeout)
+    sock.once('error', (e) => { clearTimeout(timer); reject(new Error(`Couldn't reach the proxy: ${e.message}`)) })
+    sock.once('connect', () => {
+      const auth = p.user ? `Proxy-Authorization: Basic ${Buffer.from(`${p.user}:${p.pass}`).toString('base64')}\r\n` : ''
+      sock.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n${auth}\r\n`)
+    })
+    let buf = Buffer.alloc(0)
+    const onData = (d) => {
+      buf = Buffer.concat([buf, d])
+      const end = buf.indexOf('\r\n\r\n')
+      if (end < 0) return
+      sock.removeListener('data', onData)
+      clearTimeout(timer)
+      const status = Number((/^HTTP\/1\.[01] (\d{3})/.exec(buf.slice(0, end).toString()) || [])[1])
+      if (status !== 200) { sock.destroy(); reject(new Error(status === 407 ? 'The proxy rejected the username or password.' : `The proxy refused the connection (${status || 'no answer'}).`)); return }
+      const rest = buf.slice(end + 4)
+      if (rest.length) sock.unshift(rest)
+      resolve(sock)
+    }
+    sock.on('data', onData)
+  })
+}
+
+// A UDP "socket" that relays through a SOCKS5 proxy (for Bedrock bots).
+// Looks enough like dgram's socket for the RakNet client: send(), on('message'), close().
+async function udpRelay (p, timeout = 15000) {
+  if (p.type !== 'socks5') throw new Error('Bedrock bots need a SOCKS5 proxy (UDP). HTTP and SOCKS4 proxies only carry Java bots.')
+  const { socket: control, remoteHost } = await new Promise((resolve, reject) => {
+    // createConnection() only does CONNECT; UDP ASSOCIATE needs the client object
+    const client = new SocksClient({ proxy: socksOptions(p), command: 'associate', destination: { host: '0.0.0.0', port: 0 }, timeout })
+    client.once('established', (info) => { client.removeAllListeners(); resolve(info) })
+    client.once('error', (e) => { client.removeAllListeners(); reject(e) })
+    client.connect()
+  })
+  // some proxies answer 0.0.0.0, meaning "the address you connected to"
+  const relayHost = !remoteHost.host || remoteHost.host === '0.0.0.0' ? (net.isIP(p.host) ? p.host : (await dns.lookup(p.host, { family: 4 })).address) : remoteHost.host
+  const relay = { host: relayHost, port: remoteHost.port }
+  const udp = dgram.createSocket('udp4')
+  const listeners = []
+  let closed = false
+  udp.on('message', (msg) => {
+    try {
+      const frame = SocksClient.parseUDPFrame(msg)
+      for (const fn of listeners) fn(frame.data, { address: frame.remoteHost.host, port: frame.remoteHost.port, family: 'IPv4', size: frame.data.length })
+    } catch { /* not a SOCKS frame */ }
+  })
+  udp.on('error', () => {})
+  control.on('error', () => {})
+  control.on('close', () => { if (!closed) fake.emitClose() })
+  const resolved = new Map()
+  const fake = {
+    on (ev, fn) { if (ev === 'message') listeners.push(fn); return fake },
+    once (ev, fn) { return fake.on(ev, fn) },
+    removeAllListeners () { listeners.length = 0; return fake },
+    emitClose () { closed = true; try { udp.close() } catch {} },
+    async send (buf, offset, length, port, address) {
+      if (closed) return
+      const data = Buffer.isBuffer(buf) ? buf.subarray(offset || 0, (offset || 0) + (length ?? buf.length)) : Buffer.from(buf)
+      let host = address
+      if (!net.isIP(host)) {
+        if (!resolved.has(host)) resolved.set(host, (await dns.lookup(host, { family: 4 })).address)
+        host = resolved.get(host)
+      }
+      const frame = SocksClient.createUDPFrame({ remoteHost: { host, port }, data })
+      udp.send(frame, relay.port, relay.host)
+    },
+    close () { closed = true; try { udp.close() } catch {} try { control.destroy() } catch {} },
+    address () { return { address: '0.0.0.0', port: 0, family: 'IPv4' } },
+    setRecvBufferSize () {}, setSendBufferSize () {}, unref () { return fake }, ref () { return fake }
+  }
+  return fake
+}
+
+// Checks a proxy: reaches host:port over TCP, and (SOCKS5) whether UDP works for Bedrock
+async function testProxy (p, host, port) {
+  const t0 = Date.now()
+  const sock = await tcpConnect(p, host, port, 10000)
+  const ms = Date.now() - t0
+  sock.destroy()
+  let udp = false
+  if (p.type === 'socks5') {
+    try { const r = await udpRelay(p, 8000); udp = true; r.close() } catch {}
+  }
+  return { ms, udp }
+}
+
+module.exports = { parseProxy, describe, tcpConnect, udpRelay, testProxy }

@@ -1,0 +1,78 @@
+'use strict'
+// Discord alerts: one embed per event, sent in order, waits out Discord's rate limit.
+const { config } = require('./store')
+
+const COLORS = { bad: 0xC2303A, warn: 0xD08A2E, good: 0x4D7A33, info: 0x6B7C8F }
+const queue = []
+let sending = false
+const lastSent = new Map()
+
+function validUrl (url) {
+  return /^https:\/\/(?:canary\.|ptb\.)?(?:discord|discordapp)\.com\/api\/webhooks\/\d+\/[\w-]+$/.test(String(url || '').trim())
+}
+
+// kind: settings.alerts key; key: rate-limit key (one alert per key per 30 s)
+function alert (kind, { bot, title, text, tone = 'info', key }) {
+  const s = config.settings
+  if (!validUrl(s.webhookUrl)) return
+  if (kind && !s.alerts[kind]) return
+  if (bot && !bot.cfg.alerts) return
+  const k = key || `${bot ? bot.cfg.id : '-'}:${kind}`
+  const now = Date.now()
+  if (now - (lastSent.get(k) || 0) < 30000) return
+  lastSent.set(k, now)
+  const name = bot ? bot.displayName() : 'Golem AFK'
+  queue.push({
+    url: s.webhookUrl.trim(),
+    body: {
+      username: 'Golem AFK',
+      allowed_mentions: { parse: [] },
+      embeds: [{
+        title: `${name}: ${title}`.slice(0, 250),
+        description: String(text || '').slice(0, 3900) || undefined,
+        color: COLORS[tone] || COLORS.info,
+        footer: bot ? { text: `${bot.cfg.host}${bot.cfg.port !== 25565 ? ':' + bot.cfg.port : ''}` } : undefined,
+        timestamp: new Date().toISOString()
+      }]
+    }
+  })
+  pump()
+}
+
+async function pump () {
+  if (sending) return
+  sending = true
+  while (queue.length) {
+    const job = queue[0]
+    try {
+      const res = await fetch(job.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(job.body) })
+      if (res.status === 429) {
+        const j = await res.json().catch(() => ({}))
+        await sleep(Math.min(10000, (j.retry_after || 2) * 1000))
+        continue
+      }
+    } catch { /* offline: drop it */ }
+    queue.shift()
+    await sleep(400)
+  }
+  sending = false
+}
+
+async function test (url) {
+  if (!validUrl(url)) return { ok: false, error: "That doesn't look like a Discord webhook link." }
+  try {
+    const res = await fetch(url.trim(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'Golem AFK', embeds: [{ title: 'Alerts are working', description: 'Golem AFK will post here when a bot needs you.', color: COLORS.good }] })
+    })
+    if (res.ok) return { ok: true }
+    return { ok: false, error: `Discord answered ${res.status}. Check the webhook link.` }
+  } catch (e) {
+    return { ok: false, error: "Couldn't reach Discord: " + e.message }
+  }
+}
+
+function sleep (ms) { return new Promise(r => setTimeout(r, ms)) }
+
+module.exports = { alert, test, validUrl }

@@ -1,0 +1,280 @@
+'use strict'
+// Walking for Bedrock bots. Bedrock clients move themselves: every game tick (50 ms)
+// they tell the server where they are. This finds a path through the blocks the bot
+// knows about (A*), then walks it with Minecraft's walking speed, jump and gravity.
+
+const WALK = 0.2158 // blocks per tick (4.317 blocks/s)
+const EYE = 1.62
+const MAX_NODES = 40000
+
+class BedrockWalker {
+  constructor (bot) {
+    this.bot = bot
+    this.world = bot.world
+    this.client = bot.mc
+    this.shapeCache = new Map()
+    this.vy = 0
+    this.onGround = true
+    this.feet = null
+    this.yaw = 0
+    this.pitch = 0
+  }
+
+  // ---- blocks ----
+  // top of the collision box of the block at x,y,z (0..1.5), or null when there is none
+  top (x, y, z) {
+    const s = this.world.getBlockStateId(x, y, z)
+    if (!s) return null
+    let v = this.shapeCache.get(s)
+    if (v === undefined) {
+      v = null
+      const reg = this.world.registry
+      const st = reg.blockStates[s]
+      const b = st && reg.blocksByName[st.name]
+      const shapes = reg.blockCollisionShapes
+      if (b && shapes) {
+        const ref = shapes.blocks[b.name]
+        const idx = Array.isArray(ref) ? ref[s - b.minStateId] : ref
+        const boxes = (idx !== undefined && shapes.shapes[idx]) || []
+        for (const bx of boxes) v = Math.max(v ?? 0, bx[4])
+      }
+      if (st && /lava|fire|magma|cactus|sweet_berry|powder_snow|campfire/.test(st.name)) v = -1 // never walk into these
+      if (st && /water/.test(st.name)) v = -2
+      this.shapeCache.set(s, v)
+    }
+    return v
+  }
+  free (x, y, z) { const t = this.top(x, y, z); return t === null || (t !== -1 && t !== -2 && t <= 0) }
+  // feet can stand in cell (x, y, z): solid ground under, room for the body
+  standable (x, y, z) {
+    const below = this.top(x, y - 1, z)
+    if (below === null || below < 0 || below < 0.5) return false
+    return this.free(x, y, z) && this.free(x, y + 1, z)
+  }
+  // height of the ground under a point (feet y), searching down from y
+  groundAt (px, py, pz) {
+    let best = -Infinity
+    for (const [ox, oz] of [[0, 0], [-0.29, -0.29], [0.29, -0.29], [-0.29, 0.29], [0.29, 0.29]]) {
+      const x = Math.floor(px + ox); const z = Math.floor(pz + oz)
+      for (let y = Math.floor(py + 0.6); y >= Math.floor(py) - 4; y--) {
+        const t = this.top(x, y, z)
+        if (t !== null && t > 0) { best = Math.max(best, y + t); break }
+      }
+    }
+    return best
+  }
+
+  // ---- path ----
+  findPath (sx, sy, sz, gx, gy, gz) {
+    const key = (x, y, z) => `${x},${y},${z}`
+    const h = (x, y, z) => Math.hypot(x - gx, z - gz) + (gy === null ? 0 : Math.abs(y - gy) * 0.5)
+    const goal = (x, y, z) => Math.abs(x - gx) <= 0 && Math.abs(z - gz) <= 0 && (gy === null || Math.abs(y - gy) <= 1)
+    const start = { x: sx, y: sy, z: sz, g: 0, f: h(sx, sy, sz), parent: null }
+    const open = new Heap()
+    open.push(start)
+    const seen = new Map([[key(sx, sy, sz), 0]])
+    let best = start
+    let n = 0
+    while (open.size && n++ < MAX_NODES) {
+      const cur = open.pop()
+      if (cur.g > (seen.get(key(cur.x, cur.y, cur.z)) ?? Infinity)) continue
+      if (goal(cur.x, cur.y, cur.z)) return { path: walkBack(cur), complete: true }
+      if (h(cur.x, cur.y, cur.z) < h(best.x, best.y, best.z)) best = cur
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+        const nx = cur.x + dx; const nz = cur.z + dz
+        if (!this.world.hasColumn(nx >> 4, nz >> 4)) continue
+        for (const dy of [0, 1, -1, -2, -3]) {
+          const ny = cur.y + dy
+          if (!this.standable(nx, ny, nz)) continue
+          if (dy === 1 && !this.free(cur.x, cur.y + 2, cur.z)) break // no room to jump
+          if (dy < 0) { // room to drop over the edge
+            let clear = true
+            for (let yy = ny + 1; yy <= cur.y + 1; yy++) if (!this.free(nx, yy, nz)) { clear = false; break }
+            if (!clear) continue
+          }
+          if (dx && dz) { // diagonal: both sides must be open
+            const hy = Math.max(cur.y, ny)
+            if (!this.free(cur.x + dx, hy, cur.z) || !this.free(cur.x + dx, hy + 1, cur.z) || !this.free(cur.x, hy, cur.z + dz) || !this.free(cur.x, hy + 1, cur.z + dz)) break
+            if (dy !== 0) break
+          }
+          const g = cur.g + (dx && dz ? 1.414 : 1) + (dy > 0 ? 0.8 : dy < 0 ? 0.3 * -dy : 0)
+          const k = key(nx, ny, nz)
+          if ((seen.get(k) ?? Infinity) <= g) break
+          seen.set(k, g)
+          open.push({ x: nx, y: ny, z: nz, g, f: g + h(nx, ny, nz), parent: cur })
+          break
+        }
+      }
+    }
+    return { path: walkBack(best), complete: false }
+  }
+
+  // ---- moving ----
+  syncFromServer () {
+    const e = this.world.eye
+    this.feet = { x: e.x, y: e.y - EYE, z: e.z }
+  }
+
+  async walkTo (gx, gy, gz, token) {
+    this.syncFromServer()
+    const tx = Math.floor(gx); const tz = Math.floor(gz); const ty = gy === null || gy === '' || gy === undefined ? null : Math.floor(Number(gy))
+    for (let attempt = 0; attempt < 30; attempt++) {
+      if (token.cancelled) return
+      const sx = Math.floor(this.feet.x); const sz = Math.floor(this.feet.z)
+      let sy = Math.floor(this.feet.y + 0.01)
+      if (!this.standable(sx, sy, sz) && this.standable(sx, sy + 1, sz)) sy++
+      const { path, complete } = this.findPath(sx, sy, sz, tx, ty, tz)
+      if (path.length <= 1) {
+        if (complete) return
+        throw new Error("No way there through the area the bot can see (it can't break or place blocks).")
+      }
+      const result = await this.follow(path.slice(1), token)
+      if (result === 'done' && complete) return
+      if (result === 'cancelled') return
+      // partial path, a teleport or stuck: look again from where we are
+    }
+    throw new Error('Gave up after 30 tries to find a way there.')
+  }
+
+  follow (path, token) {
+    return new Promise((resolve) => {
+      let i = 0
+      let lastProgress = Date.now()
+      let bestDist = Infinity
+      const timer = setInterval(() => {
+        try {
+          if (token.cancelled || !this.bot.mc) { clearInterval(timer); this.idle(); return resolve('cancelled') }
+          // the server moved us (teleport or correction): start over from there
+          const e = this.world.eye
+          if (Math.hypot(e.x - this.feet.x, (e.y - EYE) - this.feet.y, e.z - this.feet.z) > 2.5) {
+            this.syncFromServer(); this.teleported = true
+            clearInterval(timer); return resolve('moved')
+          }
+          const wp = path[i]
+          const cx = wp.x + 0.5; const cz = wp.z + 0.5
+          const dx = cx - this.feet.x; const dz = cz - this.feet.z
+          const dist = Math.hypot(dx, dz)
+          if (dist < bestDist - 0.05) { bestDist = dist; lastProgress = Date.now() }
+          if (Date.now() - lastProgress > 3000) { clearInterval(timer); this.idle(); return resolve('stuck') }
+          if (dist < 0.2 && Math.abs(this.feet.y - wp.y) < 0.6) {
+            i++; bestDist = Infinity
+            if (i >= path.length) { clearInterval(timer); this.tickMove(0, 0, false); this.idle(); return resolve('done') }
+            return this.tickMove(0, 0, false)
+          }
+          const step = Math.min(WALK, dist)
+          const mx = dist > 1e-6 ? dx / dist * step : 0
+          const mz = dist > 1e-6 ? dz / dist * step : 0
+          const needJump = wp.y > this.feet.y + 0.6 && this.onGround
+          if (dist > 1e-6) this.yaw = Math.atan2(-dx, dz) * 180 / Math.PI
+          this.tickMove(mx, mz, needJump)
+        } catch (err) {
+          clearInterval(timer); this.idle(); resolve('stuck')
+        }
+      }, 50)
+    })
+  }
+
+  // one game tick of movement: horizontal step, then jump/gravity
+  tickMove (mx, mz, jump) {
+    const p = this.feet
+    const before = { ...p }
+    p.x += mx; p.z += mz
+    if (jump) { this.vy = 0.42; this.onGround = false; this.jumped = true }
+    const ground = this.groundAt(p.x, p.y, p.z)
+    if (this.onGround && ground <= p.y + 0.6 && ground >= p.y - 0.01) {
+      p.y = Math.max(p.y, ground) // walk, or step up a slab
+    } else {
+      this.onGround = false
+      p.y += this.vy
+      this.vy = (this.vy - 0.08) * 0.98
+      if (p.y <= ground) { p.y = ground; this.vy = 0; this.onGround = true }
+    }
+    this.send(p.x - before.x, p.y - before.y, p.z - before.z, mx !== 0 || mz !== 0)
+  }
+
+  send (dx, dy, dz, moving) {
+    const c = this.bot.mc
+    if (!c) return
+    const flags = []
+    if (moving) flags.push('up')
+    if (this.jumped) { flags.push('start_jumping', 'jumping', 'jump_down', 'jump_pressed_raw', 'jump_current_raw'); this.jumped = false } else if (!this.onGround && this.vy > 0) flags.push('jumping', 'jump_current_raw')
+    if (this.onGround) flags.push('vertical_collision')
+    if (this.teleported) { flags.push('handled_teleport'); this.teleported = false }
+    const yawR = this.yaw * Math.PI / 180
+    const pitchR = this.pitch * Math.PI / 180
+    const eye = { x: this.feet.x, y: this.feet.y + EYE, z: this.feet.z }
+    try {
+      c.queue('player_auth_input', {
+        pitch: this.pitch, yaw: this.yaw, position: eye,
+        move_vector: { x: 0, z: moving ? 1 : 0 }, head_yaw: this.yaw,
+        input_data: flags, input_mode: 'mouse', play_mode: 'normal', interaction_model: 'crosshair',
+        interact_rotation: { x: this.pitch, z: this.yaw },
+        tick: this.bot.gameTick(), delta: { x: dx, y: dy, z: dz },
+        transaction_presence: false, item_stack_request_presence: false, block_action_presence: false,
+        vehicle_rotation_presence: false, predicted_vehicle_presence: false,
+        analogue_move_vector: { x: 0, z: moving ? 1 : 0 },
+        camera_orientation: { x: -Math.sin(yawR) * Math.cos(pitchR), y: -Math.sin(pitchR), z: Math.cos(yawR) * Math.cos(pitchR) },
+        raw_move_vector: { x: 0, z: moving ? 1 : 0 }
+      })
+    } catch {}
+    // keep our own idea of where we are (screenshots, coordinates)
+    this.world.eye = eye
+    this.world.yaw = Math.PI - yawR
+    this.world.pitch = -pitchR
+    this.bot.stats.x = Math.floor(this.feet.x); this.bot.stats.y = Math.floor(this.feet.y); this.bot.stats.z = Math.floor(this.feet.z)
+  }
+
+  // a couple of still frames so the server sees us stop
+  idle () { for (let k = 0; k < 2; k++) setTimeout(() => { if (this.feet) this.send(0, 0, 0, false) }, 50 * (k + 1)) }
+
+  look (yawDeg, pitchDeg) {
+    this.syncFromServer()
+    if (yawDeg !== null) this.yaw = yawDeg
+    this.pitch = pitchDeg
+    this.send(0, 0, 0, false)
+  }
+
+  async jump () {
+    this.syncFromServer()
+    this.onGround = true
+    this.tickMove(0, 0, true)
+    for (let k = 0; k < 14 && !this.onGround; k++) { await new Promise(r => setTimeout(r, 50)); this.tickMove(0, 0, false) }
+  }
+}
+
+// smallest f first
+class Heap {
+  constructor () { this.a = [] }
+  get size () { return this.a.length }
+  push (v) {
+    const a = this.a
+    a.push(v)
+    let i = a.length - 1
+    while (i > 0) { const p = (i - 1) >> 1; if (a[p].f <= a[i].f) break; [a[p], a[i]] = [a[i], a[p]]; i = p }
+  }
+  pop () {
+    const a = this.a
+    const top = a[0]
+    const last = a.pop()
+    if (a.length) {
+      a[0] = last
+      let i = 0
+      for (;;) {
+        const l = 2 * i + 1; const r = l + 1; let m = i
+        if (l < a.length && a[l].f < a[m].f) m = l
+        if (r < a.length && a[r].f < a[m].f) m = r
+        if (m === i) break
+        ;[a[m], a[i]] = [a[i], a[m]]; i = m
+      }
+    }
+    return top
+  }
+}
+
+function walkBack (node) {
+  const out = []
+  for (let n = node; n; n = n.parent) out.push({ x: n.x, y: n.y, z: n.z })
+  return out.reverse()
+}
+
+module.exports = { BedrockWalker }

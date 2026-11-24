@@ -1,0 +1,37 @@
+Golem AFK
+=========
+
+Keeps Minecraft accounts online on a server while this app is open.
+
+Start
+  Double-click "Start Golem AFK.bat". A black window opens (keep it open)
+  and the dashboard opens in your browser at http://localhost:8080.
+  The first time, pick a dashboard password.
+
+Add a bot
+  Click "Add bot", enter the server, and press "Add and start".
+  For a Microsoft account you'll see a code: open microsoft.com/link,
+  enter it and sign in with that account. You only do this once.
+
+From your phone
+  Same Wi-Fi as this PC: open the address shown in the black window
+  (http://192.168.x.x:8080). If Windows asks about the firewall,
+  allow Node.js on private networks.
+
+Run without the black window
+  Settings > "Start Golem AFK in the background when Windows starts".
+  Quit it from Settings > "Quit Golem AFK".
+
+Updating
+  Settings > Updates > "Install update from a zip" and pick the new
+  Golem AFK.zip. Only changed files are replaced; your bots, password
+  and Microsoft sign-ins stay. The app restarts by itself.
+
+Your data
+  Everything (password, bots, saved sign-ins, chat logs) is kept in the
+  "data" folder next to this file. Delete the whole folder to remove the app.
+
+Is it allowed?
+  That depends on each server's rules. Use alt accounts where unsure.
+
+Not affiliated with Mojang or Microsoft.

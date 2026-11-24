@@ -1,0 +1,213 @@
+'use strict'
+// Screenshots: copies the blocks around a bot and has the render worker draw its view.
+// Only the newest picture per bot is kept (data/shots/<botId>.png).
+const fs = require('fs')
+const path = require('path')
+const { Worker } = require('worker_threads')
+const { PNG } = require('pngjs')
+const { DATA } = require('./store')
+
+const SHOT_DIR = path.join(DATA, 'shots')
+fs.mkdirSync(SHOT_DIR, { recursive: true })
+const WIDTH = 480
+const HEIGHT = 270
+const RANGE = 36 // blocks around the bot that are drawn
+const RANGE_Y = 24
+
+let worker = null
+let atlasInfo = null
+const sentTables = new Set()
+const waiting = new Map()
+let nextId = 1
+let queue = Promise.resolve()
+
+function shotFile (id) { return path.join(SHOT_DIR, `${id}.png`) }
+
+function getWorker () {
+  if (worker) return worker
+  const dir = path.join(__dirname, 'assets')
+  atlasInfo = JSON.parse(fs.readFileSync(path.join(dir, 'atlas.json'), 'utf8'))
+  const img = PNG.sync.read(fs.readFileSync(path.join(dir, 'atlas.png')))
+  worker = new Worker(path.join(__dirname, 'render-worker.js'))
+  worker.unref()
+  worker.on('message', (msg) => {
+    const w = waiting.get(msg.id)
+    if (!w) return
+    waiting.delete(msg.id)
+    if (msg.error) w.reject(new Error(msg.error))
+    else w.resolve(msg)
+  })
+  worker.on('error', (e) => {
+    for (const w of waiting.values()) w.reject(e)
+    waiting.clear()
+    worker = null
+    sentTables.clear()
+  })
+  worker.postMessage({ type: 'atlas', atlas: { data: new Uint8Array(img.data), width: img.width, cols: atlasInfo.cols } })
+  return worker
+}
+
+// Per Minecraft version: what each block state looks like
+function sendTables (registry) {
+  const key = registry.version.minecraftVersion
+  if (sentTables.has(key)) return key
+  let max = 0
+  for (const b of registry.blocksArray) if (b.maxStateId > max) max = b.maxStateId
+  const n = max + 1
+  const kind = new Uint8Array(n)
+  const tex = new Uint16Array(n * 3).fill(0xFFFF)
+  const tint = new Uint8Array(n)
+  const box = new Uint8Array(n * 6)
+  const shapes = registry.blockCollisionShapes || { blocks: {}, shapes: {} }
+  const KIND = { cube: 1, cross: 2, water: 3, lava: 4 }
+  for (const b of registry.blocksArray) {
+    if (b.name === 'air' || b.name === 'cave_air' || b.name === 'void_air') continue
+    const a = atlasInfo.blocks[b.name]
+    const shapeRef = shapes.blocks[b.name]
+    for (let s = b.minStateId; s <= b.maxStateId; s++) {
+      let k = a ? KIND[a.k] : 1
+      const idx = Array.isArray(shapeRef) ? shapeRef[s - b.minStateId] : shapeRef
+      const boxes = (idx !== undefined && shapes.shapes[idx]) || []
+      if (k === 1 && boxes.length === 0) k = 0 // torches, signs, buttons: skip
+      kind[s] = k
+      if (a) {
+        tex[s * 3] = a.t[0]; tex[s * 3 + 1] = a.t[1]; tex[s * 3 + 2] = a.t[2]
+        tint[s] = (a.tint[0] ? 1 : 0) | (a.tint[1] ? 2 : 0) | (a.tint[2] ? 4 : 0) | (a.tt === 'foliage' ? 8 : 0) | (a.tt === 'water' ? 16 : 0)
+      }
+      let x0 = 1; let y0 = 1; let z0 = 1; let x1 = 0; let y1 = 0; let z1 = 0
+      if (k === 1 && boxes.length) {
+        for (const bx of boxes) {
+          x0 = Math.min(x0, bx[0]); y0 = Math.min(y0, bx[1]); z0 = Math.min(z0, bx[2])
+          x1 = Math.max(x1, bx[3]); y1 = Math.max(y1, bx[4]); z1 = Math.max(z1, bx[5])
+        }
+      } else { x0 = 0; y0 = 0; z0 = 0; x1 = 1; y1 = 1; z1 = 1 }
+      const q = v => Math.round(Math.min(1, Math.max(0, v)) * 16)
+      box.set([q(x0), q(y0), q(z0), q(x1), q(y1), q(z1)], s * 6)
+      if (box[s * 6 + 4] <= box[s * 6 + 1]) box[s * 6 + 4] = box[s * 6 + 1] + 1
+    }
+  }
+  worker.postMessage({ type: 'tables', key, tables: { kind, tex, tint, box } })
+  sentTables.add(key)
+  return key
+}
+
+function daylight (bot) {
+  const t = bot.time && typeof bot.time.timeOfDay === 'number' ? bot.time.timeOfDay : 6000
+  if (t < 12000) return 1
+  if (t < 13800) return 1 - (t - 12000) / 1800
+  if (t < 22200) return 0
+  return (t - 22200) / 1800
+}
+
+// Copies blocks + light around the bot. Runs on the main thread (fast, no allocation per block).
+function snapshot (bot) {
+  const p = bot.entity.position
+  const minY = bot.game.minY ?? -64
+  const maxY = minY + (bot.game.height ?? 384) - 1
+  const ox = Math.floor(p.x) - RANGE
+  const oz = Math.floor(p.z) - RANGE
+  const oy = Math.floor(p.y + 1.62) - RANGE_Y
+  const sx = RANGE * 2 + 1
+  const sz = RANGE * 2 + 1
+  const sy = RANGE_Y * 2 + 1
+  const states = new Uint16Array(sx * sy * sz)
+  const light = new Uint8Array(sx * sy * sz).fill(0xF0)
+  const pos = { x: 0, y: 0, z: 0 }
+  for (let cx = Math.floor(ox / 16); cx <= Math.floor((ox + sx - 1) / 16); cx++) {
+    for (let cz = Math.floor(oz / 16); cz <= Math.floor((oz + sz - 1) / 16); cz++) {
+      const col = bot.world.getColumn(cx, cz)
+      if (!col) continue
+      const x0 = Math.max(ox, cx * 16); const x1 = Math.min(ox + sx - 1, cx * 16 + 15)
+      const z0 = Math.max(oz, cz * 16); const z1 = Math.min(oz + sz - 1, cz * 16 + 15)
+      for (let y = Math.max(oy, minY); y <= Math.min(oy + sy - 1, maxY); y++) {
+        pos.y = y
+        for (let z = z0; z <= z1; z++) {
+          pos.z = z & 15
+          const row = ((y - oy) * sz + (z - oz)) * sx
+          for (let x = x0; x <= x1; x++) {
+            pos.x = x & 15
+            const i = row + (x - ox)
+            const s = col.getBlockStateId(pos)
+            states[i] = s
+            let sky = 15
+            let blk = 0
+            try { sky = col.getSkyLight(pos); blk = col.getBlockLight(pos) } catch {}
+            light[i] = ((sky & 15) << 4) | (blk & 15)
+          }
+        }
+      }
+    }
+  }
+  return { ox, oy, oz, sx, sy, sz, states, light }
+}
+
+function entities (bot) {
+  const me = bot.entity
+  const out = []
+  for (const e of Object.values(bot.entities)) {
+    if (!e || e === me || !e.position) continue
+    const d = e.position.distanceTo(me.position)
+    if (d > RANGE) continue
+    const kind = e.type === 'player' ? 'player' : e.name === 'item' ? 'item' : (e.type === 'mob' || e.type === 'hostile' || e.type === 'animal' || e.type === 'passive' || e.type === 'water_creature' || e.type === 'ambient') ? 'mob' : 'other'
+    if (kind === 'other') continue
+    out.push({
+      x: e.position.x, y: e.position.y, z: e.position.z,
+      w: kind === 'item' ? 0.3 : (e.width || 0.6),
+      h: kind === 'item' ? 0.3 : (e.height || 1.8),
+      kind,
+      name: kind === 'player' ? e.username : e.name
+    })
+  }
+  return out
+}
+
+// Takes a screenshot for an AfkBot (Java only). Resolves with { t, labels }.
+function capture (afk) {
+  const run = async () => {
+    const bot = afk.mc
+    if (!bot || !bot.entity || afk.status !== 'online') throw new Error('The bot has to be online and in a world.')
+    getWorker()
+    const key = sendTables(bot.registry)
+    const snap = snapshot(bot)
+    const eye = bot.entity.position
+    const job = {
+      key, width: WIDTH, height: HEIGHT, range: RANGE,
+      ...snap,
+      eye: [eye.x, eye.y + 1.62, eye.z],
+      yaw: bot.entity.yaw,
+      pitch: bot.entity.pitch,
+      day: daylight(bot),
+      entities: entities(bot)
+    }
+    const id = nextId++
+    const done = new Promise((resolve, reject) => waiting.set(id, { resolve, reject }))
+    worker.postMessage({ type: 'render', id, job }, [snap.states.buffer, snap.light.buffer])
+    const res = await withTimeout(done, 30000)
+    const file = shotFile(afk.cfg.id)
+    fs.writeFileSync(file + '.tmp', Buffer.from(res.png))
+    fs.renameSync(file + '.tmp', file) // replaces (deletes) the previous picture
+    return {
+      t: Date.now(),
+      labels: res.labels,
+      x: Math.floor(eye.x), y: Math.floor(eye.y), z: Math.floor(eye.z),
+      facing: facing(bot.entity.yaw)
+    }
+  }
+  // one at a time so several bots never render at once
+  const p = queue.then(run, run)
+  queue = p.catch(() => {})
+  return p
+}
+
+function facing (yaw) {
+  const deg = ((-yaw * 180 / Math.PI) % 360 + 360) % 360 // 0 = north, 90 = east
+  return ['north', 'north-east', 'east', 'south-east', 'south', 'south-west', 'west', 'north-west'][Math.round(deg / 45) % 8]
+}
+
+function withTimeout (p, ms) {
+  return Promise.race([p, new Promise((resolve, reject) => setTimeout(() => reject(new Error('Taking the screenshot took too long.')), ms))])
+}
+
+function remove (id) { fs.rmSync(shotFile(id), { force: true }) }
+
+module.exports = { capture, shotFile, remove }

@@ -1,0 +1,530 @@
+'use strict'
+// Draws what a bot sees: a textured voxel ray caster over a snapshot of the blocks
+// around it. Runs in a worker thread so bots keep running while it works.
+const { parentPort } = require('worker_threads')
+const { PNG } = require('pngjs')
+
+let atlas = null // { data: Uint8Array RGBA, width, cols }
+let hudSheet = null // { data, width, layout, widths, glyphs }
+let itemSheet = null // { data, width, cols, items }
+const tables = new Map() // key -> { kind, tex, tint, box }
+
+const TINT = { grass: [0x91, 0xBD, 0x59], foliage: [0x6D, 0xA6, 0x2B], water: [0x3F, 0x76, 0xE4] }
+const SHADE = [0.6, 0.6, 1.0, 0.5, 0.8, 0.8] // +x -x +y -y +z -z
+
+parentPort.on('message', (msg) => {
+  try {
+    if (msg.type === 'atlas') { atlas = msg.atlas; return }
+    if (msg.type === 'hud') { hudSheet = msg.hud; itemSheet = msg.items; return }
+    if (msg.type === 'tables') { tables.set(msg.key, msg.tables); return }
+    if (msg.type === 'render') {
+      const out = render(msg.job)
+      // copy into its own memory: small Buffers share Node's pool, which can't be handed over
+      const png = new Uint8Array(out.png)
+      parentPort.postMessage({ type: 'done', id: msg.id, png, labels: out.labels }, [png.buffer])
+    }
+  } catch (e) {
+    parentPort.postMessage({ type: 'done', id: msg.id, error: e.stack || String(e) })
+  }
+})
+
+function render (job) {
+  const T = tables.get(job.key)
+  if (!T || !atlas) throw new Error('renderer not ready')
+  const W = job.width
+  const H = job.height
+  const { sx, sy, sz, ox, oy, oz } = job // snapshot size + world origin
+  const states = job.states
+  const light = job.light
+  const R = job.range
+  const eye = job.eye // [x,y,z] world
+  const yaw = job.yaw
+  const pitch = job.pitch
+  const day = job.day // 0..1 daylight
+  const ents = job.entities
+
+  // camera basis
+  const fx = -Math.sin(yaw) * Math.cos(pitch)
+  const fy = Math.sin(pitch)
+  const fz = -Math.cos(yaw) * Math.cos(pitch)
+  let rx = -fz
+  let rz = fx
+  const rl = Math.hypot(rx, rz) || 1
+  rx /= rl; rz /= rl
+  const ux = -rz * fy
+  const uy = rz * fx - rx * fz
+  const uz = rx * fy
+  const vfov = 70 * Math.PI / 180
+  const tanV = Math.tan(vfov / 2)
+  const tanH = tanV * W / H
+
+  const skyTop = mix3([10, 14, 30], [100, 150, 255], day)
+  const skyLow = mix3([24, 32, 58], [190, 214, 255], day)
+
+  const png = new PNG({ width: W, height: H })
+  const px = png.data
+  const ex = eye[0] - ox
+  const ey = eye[1] - oy
+  const ez = eye[2] - oz
+  const startState = stateAt(Math.floor(ex), Math.floor(ey), Math.floor(ez))
+  const eyeInWater = startState >= 0 && T.kind[startState] === 3
+
+  const col = [0, 0, 0]
+  for (let j = 0; j < H; j++) {
+    const syf = 1 - (2 * (j + 0.5)) / H
+    for (let i = 0; i < W; i++) {
+      const sxf = (2 * (i + 0.5)) / W - 1
+      let dx = fx + rx * sxf * tanH + ux * syf * tanV
+      let dy = fy + uy * syf * tanV
+      let dz = fz + rz * sxf * tanH + uz * syf * tanV
+      const dl = Math.hypot(dx, dy, dz)
+      dx /= dl; dy /= dl; dz /= dl
+      trace(ex, ey, ez, dx, dy, dz, col)
+      const o = (j * W + i) * 4
+      px[o] = col[0]; px[o + 1] = col[1]; px[o + 2] = col[2]; px[o + 3] = 255
+    }
+  }
+
+  // player name labels (drawn by the dashboard on top of the picture)
+  const labels = []
+  for (const e of ents) {
+    if (e.kind !== 'player' || !e.name) continue
+    const vx = e.x - eye[0]
+    const vy = e.y + e.h + 0.35 - eye[1]
+    const vz = e.z - eye[2]
+    const z = vx * fx + vy * fy + vz * fz
+    if (z < 0.5) continue
+    const lx = (vx * rx + vz * rz) / (z * tanH)
+    const ly = (vx * ux + vy * uy + vz * uz) / (z * tanV)
+    if (Math.abs(lx) > 1 || Math.abs(ly) > 1) continue
+    // hidden behind blocks?
+    const dist = Math.hypot(vx, vy, vz)
+    const hit = traceDistance(ex, ey, ez, vx / dist, vy / dist, vz / dist)
+    if (hit < dist - 1.2) continue
+    labels.push({ name: e.name, x: (lx + 1) / 2, y: (1 - ly) / 2, d: Math.round(dist) })
+  }
+
+  if (job.hud && hudSheet) {
+    try { drawHud(px, W, H, job.hud) } catch (e) { /* a broken HUD must not lose the picture */ }
+  }
+
+  return { png: PNG.sync.write(png, { colorType: 2 }), labels }
+
+  // ---- helpers bound to this job ----
+  function stateAt (x, y, z) {
+    if (x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz) return -1
+    return states[(y * sz + z) * sx + x]
+  }
+  function lightAt (x, y, z) {
+    if (x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz) return 0xF0
+    return light[(y * sz + z) * sx + x]
+  }
+  function brightness (lv) {
+    const sky = lv >> 4
+    const blk = lv & 15
+    const l = Math.max(blk, sky * (0.4 + 0.6 * day))
+    return 0.1 + 0.9 * Math.pow(0.8, 15 - l)
+  }
+
+  function sky (dy, out) {
+    const k = Math.max(0, Math.min(1, dy * 1.6 + 0.1))
+    out[0] = skyLow[0] + (skyTop[0] - skyLow[0]) * k
+    out[1] = skyLow[1] + (skyTop[1] - skyLow[1]) * k
+    out[2] = skyLow[2] + (skyTop[2] - skyLow[2]) * k
+  }
+
+  // texel lookup; returns alpha, writes rgb
+  function texel (t, u, v, out) {
+    if (t === 0xFFFF) { out[0] = 128; out[1] = 128; out[2] = 128; return 255 }
+    const tx = (t % atlas.cols) * 16 + Math.min(15, Math.max(0, (u * 16) | 0))
+    const ty = ((t / atlas.cols) | 0) * 16 + Math.min(15, Math.max(0, (v * 16) | 0))
+    const o = (ty * atlas.width + tx) * 4
+    const a = atlas.data
+    out[0] = a[o]; out[1] = a[o + 1]; out[2] = a[o + 2]
+    return a[o + 3]
+  }
+
+  function trace (ox_, oy_, oz_, dx, dy, dz, out) {
+    let x = Math.floor(ox_)
+    let y = Math.floor(oy_)
+    let z = Math.floor(oz_)
+    const stepX = dx > 0 ? 1 : -1
+    const stepY = dy > 0 ? 1 : -1
+    const stepZ = dz > 0 ? 1 : -1
+    const tdx = Math.abs(1 / dx)
+    const tdy = Math.abs(1 / dy)
+    const tdz = Math.abs(1 / dz)
+    let tmx = (dx > 0 ? x + 1 - ox_ : ox_ - x) * tdx
+    let tmy = (dy > 0 ? y + 1 - oy_ : oy_ - y) * tdy
+    let tmz = (dz > 0 ? z + 1 - oz_ : oz_ - z) * tdz
+    let t = 0
+    let inWater = eyeInWater
+    let waterStart = eyeInWater ? 0 : -1
+    let waterCol = null
+    let hitR = -1
+    let hitG = 0
+    let hitB = 0
+    let hitT = R
+    const c = [0, 0, 0]
+
+    // entities: nearest box along the ray
+    let entT = Infinity
+    let entC = null
+    for (const e of ents) {
+      const r = rayBox(ox_, oy_, oz_, dx, dy, dz, e.x - ox - e.w / 2, e.y - oy, e.z - oz - e.w / 2, e.x - ox + e.w / 2, e.y - oy + e.h, e.z - oz + e.w / 2)
+      if (r && r.t < entT && r.t > 0.05) { entT = r.t; entC = entityColor(e, (oy_ + dy * r.t) - (e.y - oy), r.face) }
+    }
+
+    while (t < R) {
+      const s = stateAt(x, y, z)
+      if (s < 0 && t > 2) break
+      if (s > 0) {
+        const kind = T.kind[s]
+        if (kind === 3) { // water
+          if (!inWater) {
+            inWater = true
+            waterStart = t
+            texel(T.tex[s * 3], fract(ox_ + dx * t), fract(oz_ + dz * t), c)
+            waterCol = [c[0] * TINT.water[0] / 255, c[1] * TINT.water[1] / 255, c[2] * TINT.water[2] / 255]
+            const b = brightness(lightAt(x, y + 1, z))
+            waterCol[0] *= b; waterCol[1] *= b; waterCol[2] *= b
+          }
+        } else if (kind !== 0) {
+          if (inWater && kind !== 3 && waterStart >= 0 && !waterCol) waterCol = [30, 60, 140]
+          const hit = hitBlock(s, kind, x, y, z, ox_, oy_, oz_, dx, dy, dz, t, c)
+          if (hit >= 0) {
+            hitT = hit
+            hitR = c[0]; hitG = c[1]; hitB = c[2]
+            break
+          }
+        }
+      }
+      if (tmx < tmy && tmx < tmz) { x += stepX; t = tmx; tmx += tdx } else if (tmy < tmz) { y += stepY; t = tmy; tmy += tdy } else { z += stepZ; t = tmz; tmz += tdz }
+    }
+
+    let r, g, b
+    if (entC && entT < hitT) {
+      hitT = entT
+      const lv = brightness(lightAt(Math.floor(ox_ + dx * entT), Math.floor(oy_ + dy * entT), Math.floor(oz_ + dz * entT)))
+      r = entC[0] * lv; g = entC[1] * lv; b = entC[2] * lv
+    } else if (hitR >= 0) {
+      r = hitR; g = hitG; b = hitB
+    } else {
+      sky(dy, c)
+      r = c[0]; g = c[1]; b = c[2]
+      hitT = R
+    }
+    // distance fog
+    const f = Math.max(0, Math.min(1, (hitT - R * 0.55) / (R * 0.45)))
+    if (f > 0) {
+      sky(Math.max(dy, 0), c)
+      r += (c[0] - r) * f; g += (c[1] - g) * f; b += (c[2] - b) * f
+    }
+    if (inWater && waterStart >= 0) {
+      const wc = waterCol || [30, 60, 140]
+      const depth = Math.min(hitT, R) - waterStart
+      const a = Math.min(0.92, 0.5 + depth * 0.06)
+      r += (wc[0] - r) * a; g += (wc[1] - g) * a; b += (wc[2] - b) * a
+    }
+    out[0] = r; out[1] = g; out[2] = b
+  }
+
+  // returns distance of the hit or -1; writes the lit colour into c
+  function hitBlock (s, kind, x, y, z, ox_, oy_, oz_, dx, dy, dz, tCell, c) {
+    if (kind === 2) { // cross sprite: two diagonal planes
+      let best = -1
+      for (let p = 0; p < 2; p++) {
+        // plane A: local x = local z; plane B: local x + local z = 1
+        const den = p === 0 ? dx - dz : dx + dz
+        if (Math.abs(den) < 1e-6) continue
+        const tv = p === 0 ? ((x - ox_) - (z - oz_)) / den : (1 + x + z - ox_ - oz_) / den
+        if (tv < tCell - 1e-4 || tv > tCell + 1.8) continue
+        const hx = ox_ + dx * tv - x
+        const hy = oy_ + dy * tv - y
+        const hz = oz_ + dz * tv - z
+        if (hx < 0 || hx > 1 || hz < 0 || hz > 1 || hy < 0 || hy > 1) continue
+        if (best >= 0 && tv >= best) continue
+        const a = texel(T.tex[s * 3 + 1], hx, 1 - hy, c)
+        if (a < 128) continue
+        best = tv
+        tintIt(s, 1, c)
+        const b = brightness(lightAt(x, y, z))
+        c[0] *= b; c[1] *= b; c[2] *= b
+      }
+      return best
+    }
+    const bo = s * 6
+    const box = T.box
+    const r = rayBox(ox_, oy_, oz_, dx, dy, dz,
+      x + box[bo] / 16, y + box[bo + 1] / 16, z + box[bo + 2] / 16,
+      x + box[bo + 3] / 16, y + box[bo + 4] / 16, z + box[bo + 5] / 16)
+    if (!r) return -1
+    const hx = ox_ + dx * r.t
+    const hy = oy_ + dy * r.t
+    const hz = oz_ + dz * r.t
+    let u, v, which
+    switch (r.face) {
+      case 2: case 3: u = fract(hx); v = fract(hz); which = r.face === 2 ? 0 : 2; break
+      case 0: case 1: u = fract(hz); v = 1 - (hy - y); which = 1; break
+      default: u = fract(hx); v = 1 - (hy - y); which = 1
+    }
+    const a = texel(T.tex[s * 3 + which], u, v, c)
+    if (a < 128) return -1 // see-through texel (glass, leaves)
+    tintIt(s, which, c)
+    // light from the open side of the face
+    const n = FACE_N[r.face]
+    const full = box[bo] === 0 && box[bo + 1] === 0 && box[bo + 2] === 0 && box[bo + 3] === 16 && box[bo + 4] === 16 && box[bo + 5] === 16
+    const lv = full ? lightAt(x + n[0], y + n[1], z + n[2]) : Math.max(lightAt(x, y, z), lightAt(x + n[0], y + n[1], z + n[2]))
+    const b = brightness(lv) * SHADE[r.face]
+    c[0] *= b; c[1] *= b; c[2] *= b
+    return r.t
+  }
+
+  function tintIt (s, which, c) {
+    const bits = T.tint[s]
+    if (!(bits & (1 << which))) return
+    const tc = bits & 16 ? TINT.water : bits & 8 ? TINT.foliage : TINT.grass
+    c[0] = c[0] * tc[0] / 255; c[1] = c[1] * tc[1] / 255; c[2] = c[2] * tc[2] / 255
+  }
+
+  function traceDistance (ox_, oy_, oz_, dx, dy, dz) {
+    const c = [0, 0, 0]
+    let x = Math.floor(ox_); let y = Math.floor(oy_); let z = Math.floor(oz_)
+    const stepX = dx > 0 ? 1 : -1; const stepY = dy > 0 ? 1 : -1; const stepZ = dz > 0 ? 1 : -1
+    const tdx = Math.abs(1 / dx); const tdy = Math.abs(1 / dy); const tdz = Math.abs(1 / dz)
+    let tmx = (dx > 0 ? x + 1 - ox_ : ox_ - x) * tdx
+    let tmy = (dy > 0 ? y + 1 - oy_ : oy_ - y) * tdy
+    let tmz = (dz > 0 ? z + 1 - oz_ : oz_ - z) * tdz
+    let t = 0
+    while (t < R) {
+      const s = stateAt(x, y, z)
+      if (s > 0) {
+        const kind = T.kind[s]
+        if (kind === 1 || kind === 4) {
+          const h = hitBlock(s, kind, x, y, z, ox_, oy_, oz_, dx, dy, dz, t, c)
+          if (h >= 0) return h
+        }
+      }
+      if (tmx < tmy && tmx < tmz) { x += stepX; t = tmx; tmx += tdx } else if (tmy < tmz) { y += stepY; t = tmy; tmy += tdy } else { z += stepZ; t = tmz; tmz += tdz }
+    }
+    return Infinity
+  }
+}
+
+// ---- HUD ------------------------------------------------------------------
+const MC_COLORS = {
+  0: [0, 0, 0], 1: [0, 0, 170], 2: [0, 170, 0], 3: [0, 170, 170], 4: [170, 0, 0], 5: [170, 0, 170], 6: [255, 170, 0], 7: [170, 170, 170],
+  8: [85, 85, 85], 9: [85, 85, 255], a: [85, 255, 85], b: [85, 255, 255], c: [255, 85, 85], d: [255, 85, 255], e: [255, 255, 85], f: [255, 255, 255]
+}
+// small-caps letters many servers use on scoreboards, drawn as normal capitals
+const SMALL_CAPS = { 'ᴀ': 'A', 'ʙ': 'B', 'ᴄ': 'C', 'ᴅ': 'D', 'ᴇ': 'E', 'ꜰ': 'F', 'ɢ': 'G', 'ʜ': 'H', 'ɪ': 'I', 'ᴊ': 'J', 'ᴋ': 'K', 'ʟ': 'L', 'ᴍ': 'M', 'ɴ': 'N', 'ᴏ': 'O', 'ᴘ': 'P', 'ꞯ': 'Q', 'ʀ': 'R', 'ꜱ': 'S', 'ᴛ': 'T', 'ᴜ': 'U', 'ᴠ': 'V', 'ᴡ': 'W', 'ʏ': 'Y', 'ᴢ': 'Z', 'ǫ': 'Q', 'х': 'x' }
+
+function drawHud (px, W, H, hud) {
+  const S = Math.max(1, Math.round(W / 427)) // GUI scale: 2 at 854 wide
+  const gw = Math.floor(W / S)
+  const gh = Math.floor(H / S)
+  const L = hudSheet.layout
+
+  const put = (x, y, r, g, b, a) => {
+    if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return
+    const o = (y * W + x) * 4
+    const k = a / 255
+    px[o] = px[o] + (r - px[o]) * k; px[o + 1] = px[o + 1] + (g - px[o + 1]) * k; px[o + 2] = px[o + 2] + (b - px[o + 2]) * k
+  }
+  // sprite from a sheet, at GUI coordinates
+  const blitFrom = (sheet, sx, sy, sw, sh, gx, gy, tint, dw) => {
+    const d = sheet.data
+    const w = dw === undefined ? sw : dw
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < w; x++) {
+        const o = ((sy + y) * sheet.width + sx + x) * 4
+        const a = d[o + 3]
+        if (!a) continue
+        let r = d[o]; let g = d[o + 1]; let b = d[o + 2]
+        if (tint) { r = r * tint[0] / 255; g = g * tint[1] / 255; b = b * tint[2] / 255 }
+        for (let yy = 0; yy < S; yy++) for (let xx = 0; xx < S; xx++) put((gx + x) * S + xx, (gy + y) * S + yy, r, g, b, a)
+      }
+    }
+  }
+  const sprite = (name, gx, gy, width) => { const r = L[name]; if (r) blitFrom(hudSheet, r[0], r[1], r[2], r[3], gx, gy, null, width) }
+  const fill = (gx, gy, w, h, r, g, b, a) => {
+    for (let y = gy * S; y < (gy + h) * S; y++) for (let x = gx * S; x < (gx + w) * S; x++) put(x, y, r, g, b, a)
+  }
+
+  // text with § colour codes in Minecraft's font
+  const parse = (str) => {
+    const out = []
+    let color = [255, 255, 255]
+    let bold = false
+    const t = String(str || '')
+    for (let i = 0; i < t.length; i++) {
+      const ch = t[i]
+      if (ch === '§' && i + 1 < t.length) {
+        const c = t[i + 1].toLowerCase()
+        if (c === '#' && /^[0-9a-f]{6}$/i.test(t.slice(i + 2, i + 8))) { color = hexColor(t.slice(i + 2, i + 8)); bold = false; i += 7; continue }
+        if (c === 'x' && /^(§[0-9a-f]){6}$/i.test(t.slice(i + 2, i + 14))) { color = hexColor(t.slice(i + 2, i + 14).replace(/§/g, '')); bold = false; i += 13; continue }
+        if (MC_COLORS[c]) { color = MC_COLORS[c]; bold = false } else if (c === 'l') bold = true; else if (c === 'r') { color = [255, 255, 255]; bold = false }
+        i++
+        continue
+      }
+      out.push({ ch: SMALL_CAPS[ch] || ch, color, bold })
+    }
+    return out
+  }
+  const glyphWidth = (ch) => {
+    const gi = hudSheet.glyphs[ch]
+    return gi === undefined ? 5 : hudSheet.widths[gi] + 1
+  }
+  const width = (str) => parse(str).reduce((w, c) => w + glyphWidth(c.ch) + (c.bold ? 1 : 0), 0)
+  const drawGlyph = (ch, gx, gy, color) => {
+    const gi = hudSheet.glyphs[ch]
+    if (gi === undefined) return
+    const f = L.font
+    blitFrom(hudSheet, f[0] + (gi % 16) * 8, f[1] + Math.floor(gi / 16) * 8, 8, 8, gx, gy, color)
+  }
+  const text = (str, gx, gy, shadow = true, forceColor) => {
+    let x = gx
+    for (const c of parse(str)) {
+      const col = forceColor || c.color
+      if (shadow) drawGlyph(c.ch, x + 1, gy + 1, [col[0] / 4, col[1] / 4, col[2] / 4])
+      drawGlyph(c.ch, x, gy, col)
+      if (c.bold) { if (shadow) drawGlyph(c.ch, x + 2, gy + 1, [col[0] / 4, col[1] / 4, col[2] / 4]); drawGlyph(c.ch, x + 1, gy, col) }
+      x += glyphWidth(c.ch) + (c.bold ? 1 : 0)
+    }
+    return x - gx
+  }
+
+  // crosshair
+  sprite('crosshair', Math.floor(gw / 2) - 7, Math.floor(gh / 2) - 7)
+
+  // hotbar + items
+  const hx = Math.floor(gw / 2) - 91
+  const hy = gh - 22
+  sprite('hotbar', hx, hy)
+  const sel = Math.min(8, Math.max(0, hud.selected || 0))
+  sprite('selection', hx - 1 + sel * 20, hy - 1)
+  const items = hud.hotbar || []
+  for (let i = 0; i < 9; i++) {
+    const it = items[i]
+    if (!it || !itemSheet) continue
+    const idx = itemSheet.items[it.name]
+    const ix = hx + 3 + i * 20
+    const iy = hy + 3
+    if (idx !== undefined) blitFrom(itemSheet, (idx % itemSheet.cols) * 16, Math.floor(idx / itemSheet.cols) * 16, 16, 16, ix, iy)
+    else fill(ix + 3, iy + 3, 10, 10, 160, 120, 200, 200)
+    if (it.count > 1) { const t = String(it.count); text(t, ix + 17 - width(t), iy + 9) }
+  }
+
+  if (hud.survival !== false) {
+    // experience
+    sprite('xp_bg', hx, gh - 29)
+    const p = Math.max(0, Math.min(1, hud.xpProgress || 0))
+    if (p > 0) sprite('xp_fill', hx, gh - 29, Math.round(p * 182))
+    if (hud.xpLevel > 0) {
+      const t = String(hud.xpLevel)
+      const tx = Math.floor(gw / 2 - width(t) / 2)
+      const ty = gh - 35
+      for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) text(t, tx + ox, ty + oy, false, [0, 0, 0])
+      text(t, tx, ty, false, [128, 255, 32])
+    }
+    // hearts (left) and food (right)
+    const hp = Math.max(0, Math.round(hud.health ?? 20))
+    const food = Math.max(0, Math.round(hud.food ?? 20))
+    for (let i = 0; i < 10; i++) {
+      const x = hx + i * 8
+      sprite('heart_empty', x, gh - 39)
+      if (hp >= i * 2 + 2) sprite('heart_full', x, gh - 39); else if (hp === i * 2 + 1) sprite('heart_half', x, gh - 39)
+      const fx = hx + 182 - 9 - i * 8
+      sprite('food_empty', fx, gh - 39)
+      if (food >= i * 2 + 2) sprite('food_full', fx, gh - 39); else if (food === i * 2 + 1) sprite('food_half', fx, gh - 39)
+    }
+  }
+
+  // action bar
+  if (hud.actionBar) {
+    const t = hud.actionBar
+    text(t, Math.floor(gw / 2 - width(t) / 2), gh - 68 - (hud.survival !== false ? 0 : -14))
+  }
+
+  // scoreboard on the right
+  const sb = hud.sidebar
+  if (sb && sb.lines && sb.lines.length) {
+    const lines = sb.lines.slice(0, 15)
+    const title = sb.title || ''
+    const maxW = Math.max(width(title), ...lines.map(width))
+    const left = gw - maxW - 3
+    const bottom = Math.floor(gh / 2 + (lines.length * 9) / 3)
+    lines.forEach((ln, i) => {
+      const y = bottom - (lines.length - i) * 9
+      fill(left - 2, y, maxW + 4, 9, 0, 0, 0, 76)
+      text(ln, left, y, false)
+    })
+    const ty = bottom - (lines.length + 1) * 9
+    fill(left - 2, ty, maxW + 4, 9, 0, 0, 0, 102)
+    text(title, Math.floor(left + maxW / 2 - width(title) / 2), ty, false)
+  }
+}
+
+function hexColor (h) { return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)] }
+
+const FACE_N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+
+// slab test; face: 0 +x 1 -x 2 +y 3 -y 4 +z 5 -z (the side the ray enters)
+function rayBox (ox, oy, oz, dx, dy, dz, x0, y0, z0, x1, y1, z1) {
+  let tmin = -Infinity
+  let tmax = Infinity
+  let face = -1
+  const o = [ox, oy, oz]
+  const d = [dx, dy, dz]
+  const lo = [x0, y0, z0]
+  const hi = [x1, y1, z1]
+  for (let a = 0; a < 3; a++) {
+    if (Math.abs(d[a]) < 1e-9) {
+      if (o[a] < lo[a] || o[a] > hi[a]) return null
+      continue
+    }
+    let t1 = (lo[a] - o[a]) / d[a]
+    let t2 = (hi[a] - o[a]) / d[a]
+    let f = a * 2 + 1 // entering through the low side -> face pointing -axis
+    if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; f = a * 2 }
+    if (t1 > tmin) { tmin = t1; face = f }
+    if (t2 < tmax) tmax = t2
+    if (tmin > tmax) return null
+  }
+  if (tmax < 0) return null
+  if (tmin < 0) return { t: 0.0001, face: face < 0 ? 2 : face }
+  // map axis-face index: 0/1 = x(+/-), 2/3 = y, 4/5 = z
+  return { t: tmin, face }
+}
+
+function entityColor (e, hy, face) {
+  const shade = SHADE[face] || 0.8
+  let c
+  if (e.kind === 'player') {
+    const f = hy / e.h
+    c = f > 0.78 ? (f > 0.95 ? [74, 50, 30] : [196, 140, 100]) : f > 0.4 ? [58, 170, 175] : [60, 62, 150]
+  } else if (e.kind === 'item') {
+    c = [235, 200, 70]
+  } else {
+    c = MOB_COLORS[e.name]
+    if (!c) {
+      const palette = [[150, 120, 90], [200, 200, 200], [110, 110, 110], [210, 140, 160], [160, 110, 70], [90, 130, 80]]
+      let h = 0
+      for (const ch of e.name || 'mob') h = (h * 31 + ch.charCodeAt(0)) >>> 0
+      c = palette[h % palette.length]
+    }
+  }
+  return [c[0] * shade, c[1] * shade, c[2] * shade]
+}
+
+const MOB_COLORS = {
+  cow: [92, 66, 46], mooshroom: [160, 40, 40], pig: [235, 160, 160], sheep: [230, 230, 225], chicken: [240, 240, 240],
+  zombie: [70, 120, 75], husk: [150, 130, 90], drowned: [70, 140, 130], skeleton: [200, 200, 200], stray: [170, 190, 190],
+  creeper: [80, 170, 70], spider: [50, 45, 45], cave_spider: [30, 60, 70], enderman: [25, 25, 30], slime: [110, 200, 100],
+  villager: [140, 100, 80], wandering_trader: [60, 80, 160], iron_golem: [205, 200, 190], horse: [150, 100, 60],
+  wolf: [215, 210, 205], cat: [200, 150, 80], witch: [70, 50, 90], pillager: [110, 110, 120], blaze: [230, 170, 40],
+  ghast: [240, 240, 240], piglin: [220, 160, 130], zombified_piglin: [210, 140, 130], shulker: [150, 100, 150]
+}
+
+function fract (v) { return v - Math.floor(v) }
+function mix3 (a, b, k) { return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k] }

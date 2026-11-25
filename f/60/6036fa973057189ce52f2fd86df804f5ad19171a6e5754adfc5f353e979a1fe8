@@ -1,0 +1,1201 @@
+'use strict'
+// One AFK bot: connects with mineflayer, keeps itself online and reports what happens.
+const fs = require('fs')
+const path = require('path')
+const { EventEmitter } = require('events')
+const mineflayer = require('mineflayer')
+const mc = require('minecraft-protocol')
+const mcData = require('minecraft-data')
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
+const { DATA, config, save, addHistory, proxyForBot, addDay } = require('./store')
+const proxyLib = require('./proxy')
+const { alert } = require('./alerts')
+const shots = require('./shots')
+const { parseShards, shardsFromChat } = require('./shards')
+
+// Chat isn't saved anywhere: only the newest lines stay in memory.
+fs.rmSync(path.join(DATA, 'logs'), { recursive: true, force: true }) // from version 1.0
+const SUPPORTED = mcData.supportedVersions.pc
+const NEWEST = SUPPORTED[SUPPORTED.length - 1]
+const MAX_LOG = 100
+const AFK_SIGN = /next shard|shards? in \d|afk (area|zone)/i // what Donut's action bar says in the AFK area
+function shardValue (v) {
+  const m = String(v ?? '').replace(/,/g, '').match(/(\d+(?:\.\d+)?)\s*([kmb])?/i)
+  if (!m) return null
+  return parseFloat(m[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1)
+}
+function today () { const d = new Date(); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}` }
+
+const ANTI_AFK = {
+  look (bot) {
+    const yaw = bot.entity.yaw + (Math.random() - 0.5) * 1.6
+    const pitch = (Math.random() - 0.5) * 0.8
+    return bot.look(yaw, pitch, false)
+  },
+  swing (bot) { bot.swingArm('right') },
+  jump (bot) { return hold(bot, 'jump', 350) },
+  sneak (bot) { return hold(bot, 'sneak', 700) },
+  step (bot) { return hold(bot, 'forward', 250).then(() => hold(bot, 'back', 250)) }
+}
+
+function hold (bot, control, ms) {
+  bot.setControlState(control, true)
+  return new Promise(resolve => setTimeout(() => { try { bot.setControlState(control, false) } catch {} resolve() }, ms))
+}
+
+function stripCodes (s) { return String(s || '').replace(/§#[0-9a-f]{6}/gi, '').replace(/§[0-9a-fk-orx]/gi, '') }
+
+// Who sent a chat line? Uses the sender from the packet if the server gave one,
+// otherwise looks for a known player name followed by a separator (<Name>, Name:, [Rank] Name » ...).
+function findSender (text, names, known) {
+  const head = text.slice(0, 120)
+  const list = known ? [known] : names.slice().sort((a, b) => b.length - a.length)
+  for (const name of list) {
+    if (!name || name.length < 2) continue
+    const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    let m = new RegExp('<' + n + '>\\s*', 'i').exec(head)
+    if (!m) m = new RegExp('(?:^|[\\s\\]\\)|*])' + n + '(?:\\s*\\[[^\\]]{0,20}\\])?\\s*(?:»|>>|>|:|\\||➤|→|-)\\s?', 'i').exec(head)
+    if (m && m.index < 80) return { from: name, cut: m.index + m[0].length }
+  }
+  return known ? { from: known, cut: 0 } : null
+}
+
+// Cuts a §-coded string after `cut` visible characters, keeping the colour in effect.
+function sliceMotd (motd, cut) {
+  let seen = 0
+  let codes = ''
+  let i = 0
+  while (i < motd.length && seen < cut) {
+    if (motd[i] === '§' && motd[i + 1] === '#') { codes = motd.slice(i, i + 8); i += 8; continue }
+    if (motd[i] === '§' && i + 1 < motd.length) {
+      const c = motd[i + 1].toLowerCase()
+      codes = /[0-9a-fr]/.test(c) ? '§' + c : codes + '§' + c
+      i += 2
+      continue
+    }
+    seen++
+    i++
+  }
+  return codes + motd.slice(i)
+}
+
+const STEP_TYPES = ['move', 'wait', 'chat', 'look', 'slot', 'use', 'useBlock', 'click', 'close', 'jump', 'sneak', 'attack']
+const LOOK = { north: [0, 0], east: [-Math.PI / 2, 0], south: [Math.PI, 0], west: [Math.PI / 2, 0], up: [null, Math.PI / 2], down: [null, -Math.PI / 2] }
+
+async function pickVersion (host, port, wanted, connect) {
+  if (wanted && wanted !== 'auto') return { version: wanted, note: '' }
+  const res = await mc.ping({ host, port, closeTimeout: 10000, ...(connect ? { connect } : {}) })
+  const protocol = res && res.version && res.version.protocol
+  const matches = (mcData.postNettyVersionsByProtocolVersion.pc[protocol] || [])
+    .map(v => v.minecraftVersion).filter(v => SUPPORTED.includes(v))
+  if (matches.length) return { version: matches[0], note: '' }
+  const shown = stripCodes(res && res.version && res.version.name) || `protocol ${protocol}`
+  return { version: NEWEST, note: `The server says "${shown}", which the bot can't speak directly, so it's joining as ${NEWEST}.` }
+}
+
+class AfkBot extends EventEmitter {
+  constructor (cfg) {
+    super()
+    this.cfg = cfg
+    this.status = 'stopped' // stopped | connecting | signin | online | waiting | paused | error
+    this.detail = ''
+    this.msa = null
+    this.mc = null
+    this.conn = 0
+    this.fails = 0
+    this.timers = []
+    this.reconnectTimer = null
+    this.nextTry = 0
+    this.onlineSince = 0
+    this.lastKick = ''
+    this.stats = {}
+    this.log = []
+    this.cmdLog = [] // commands and their replies, for the dashboard (memory only, 100 lines)
+    this.macro = null
+    this.shot = null
+    try {
+      const st = fs.statSync(shots.shotFile(cfg.id))
+      this.shot = { t: st.mtimeMs, labels: [] }
+    } catch {}
+  }
+
+  edition () { return 'java' }
+
+  displayName () {
+    return this.cfg.label || this.cfg.account || this.cfg.name || 'New bot'
+  }
+
+  publicState () {
+    return {
+      cfg: this.cfg,
+      status: this.status,
+      detail: this.detail,
+      msa: this.msa,
+      nextTry: this.nextTry,
+      onlineSince: this.onlineSince,
+      lastKick: this.lastKick,
+      stats: this.stats,
+      shot: this.shot,
+      macro: this.macro ? { id: this.macro.id, step: this.macro.step, loops: this.macro.loops, name: this.macro.name, steps: this.macro.steps } : null,
+      afk: { in: this.inAfk(), seenAt: this.afkSeenAt || 0, since: this.afkSince || 0 },
+      stash: this.stash(),
+      proxyHealth: AfkBot.healthOf ? AfkBot.healthOf(this) : null,
+      job: this.job ? { kind: this.job.kind, mob: this.job.mob, amount: this.job.amount, bought: this.job.bought, state: this.job.state, text: this.job.text, at: this.job.at || 0 } : null,
+      edition: this.edition()
+    }
+  }
+
+  changed () {
+    this.emit('change', this)
+  }
+
+  // counts what the bot earns: any rise in its shards (spending lowers them, which isn't counted)
+  noteShards () {
+    const v = shardValue(this.stats && this.stats.shards)
+    if (v === null) return
+    const before = this.lastShards
+    this.lastShards = v
+    if (before === undefined || v <= before) return
+    const gain = v - before
+    if (gain > 5000) return // a big jump is a transfer or a first reading, not AFK earnings
+    const t = this.cfg.tally || (this.cfg.tally = { earned: 0, day: '', today: 0, spent: 0, bought: {}, disconnects: 0, lastShardAt: 0 })
+    if (t.day !== today()) { t.day = today(); t.today = 0 }
+    t.earned += gain
+    t.today += gain
+    t.lastShardAt = Date.now()
+    save()
+  }
+
+  // In Donut's AFK area the action bar counts down to the next shard, and shards keep coming
+  inAfk () {
+    if (this.status !== 'online') return false
+    const now = Date.now()
+    if (this.afkSeenAt && now - this.afkSeenAt < 90000) return true
+    // or the scoreboard's real shard count just went up
+    return !!(this.realShardAt && now - this.realShardAt < 150000 && this.realShardAt > (this.onlineSince || 0))
+  }
+
+  setStatus (status, detail = '') {
+    this.status = status
+    this.detail = detail
+    if (status !== 'signin') this.msa = null
+    if (status !== 'online') addHistory(this.cfg.id, 'off')
+    this.changed()
+  }
+
+  write (kind, text, motd, from) {
+    this.lineNo = (this.lineNo || 0) + 1
+    const line = { n: this.lineNo, t: Date.now(), kind, text: String(text), motd: motd || null, from: from || null }
+    this.log.push(line)
+    if (this.log.length > MAX_LOG) this.log.splice(0, this.log.length - MAX_LOG)
+    this.emit('line', this, line)
+    // the dashboard shows only commands, what the server answers right after, and problems
+    const now = Date.now()
+    let show = false
+    if (kind === 'you' && line.text.startsWith('/')) { show = true; this.cmdUntil = now + 4000 } else if (kind === 'server' && now < (this.cmdUntil || 0)) show = true
+    else if (kind === 'error') show = true
+    else if (kind === 'info' && /^(Shop|Bought|Buying|Not in the AFK|Back in the AFK|Logged in|In the world|The server is restarting)/.test(line.text)) show = true
+    if (show) {
+      this.cmdLog.push(line)
+      if (this.cmdLog.length > MAX_LOG) this.cmdLog.splice(0, this.cmdLog.length - MAX_LOG)
+      this.emit('cmd', this, line)
+    }
+  }
+
+  // ---- control ------------------------------------------------------------
+
+  // using a connection right now (or about to)
+  isActive () {
+    return !this.queued && (!!this.mc || ['online', 'connecting', 'signin', 'waiting'].includes(this.status))
+  }
+
+  start () {
+    // the server sets AfkBot.gate to enforce the proxy limits
+    const blocked = AfkBot.gate && !this.mc ? AfkBot.gate(this) : ''
+    if (blocked) {
+      this.cfg.running = false
+      save()
+      this.setStatus('stopped', blocked)
+      this.write('error', blocked)
+      return false
+    }
+    this.cfg.running = true
+    save()
+    this.fails = 0
+    clearTimeout(this.reconnectTimer)
+    if (this.mc) return
+    this.connect()
+  }
+
+  stop (why = 'Stopped') {
+    this.queued = false // drop out of the start-up queue
+    this.cfg.running = false
+    save()
+    clearTimeout(this.reconnectTimer)
+    this.nextTry = 0
+    if (this.mc) {
+      this.stopReason = why
+      const conn = this.conn
+      this.quitClient()
+      setTimeout(() => { if (conn === this.conn && !this.ended) this.handleEnd(conn, 'quit') }, 3000)
+    } else {
+      this.setStatus('stopped', why === 'Stopped' ? '' : why)
+    }
+  }
+
+  restart () {
+    if (this.mc) {
+      this.restarting = true
+      const conn = this.conn
+      this.quitClient()
+      setTimeout(() => { if (conn === this.conn && !this.ended) this.handleEnd(conn, 'quit') }, 3000)
+    } else {
+      this.start()
+    }
+  }
+
+  quitClient () { try { this.mc.quit() } catch {} }
+  closeClient (bot) { try { bot._client.end() } catch {} }
+
+  say (text) {
+    if (!this.mc || this.status !== 'online') return false
+    this.sendLine(String(text).slice(0, 256))
+    return true
+  }
+
+  sendLine (text, quiet) {
+    if (/^\/shards?\b/i.test(text)) this.shardsAsked = Date.now() // the reply corrects the count
+    if (!quiet) this.write('you', text, null, this.cfg.account || this.cfg.name || 'You')
+    this.mc.chat(text)
+  }
+
+  setActionBar (text, motd) {
+    this.actionBarAt = Date.now()
+    if (AFK_SIGN.test(text)) {
+      const was = this.inAfk()
+      this.afkSeenAt = Date.now()
+      if (!was) this.changed()
+    }
+    this.actionBarMotd = motd || text
+    if (text !== this.stats.actionBar) { this.stats.actionBar = text; this.changed() }
+  }
+
+  // The dashboard counts shards itself: +1 for every full minute in the AFK area (no /shards,
+  // which can get flagged). An exact number on the scoreboard (Java) keeps the count right;
+  // a rounded one (Bedrock, "1.11K") only fills it in when the count is still unknown.
+  syncBoard (reading) {
+    const v = shardValue(reading)
+    if (v === null) return this.cfg.shards ?? null
+    const exact = !/[kmbt]/i.test(String(reading))
+    if (exact) {
+      if (this.cfg.shards !== v) {
+        if (this.cfg.shards != null && v > this.cfg.shards) this.realShardAt = Date.now()
+        this.cfg.shards = v
+        save()
+      }
+    } else if (this.cfg.shards == null) {
+      this.cfg.shards = Math.round(v)
+      save()
+    }
+    return this.cfg.shards
+  }
+
+  boardReading () { return this.mc ? readSidebarShards(this.mc) : null }
+
+  // the spawners in the bot's own inventory, grouped by name ("Skeleton Spawner": 12)
+  stash () {
+    const items = this.inventoryItems()
+    const kinds = new Map()
+    let total = 0
+    for (const it of items) {
+      if (!it || !/spawner/i.test(it.name)) continue
+      const label = spawnerLabel(it, this)
+      kinds.set(label, (kinds.get(label) || 0) + it.count)
+      total += it.count
+    }
+    return { total, kinds: [...kinds].map(([name, count]) => ({ name, count })) }
+  }
+
+  position () {
+    const e = this.mc && this.mc.entity
+    return e ? { x: e.position.x, y: e.position.y, z: e.position.z, dim: this.stats.dimension } : null
+  }
+
+  async dropSlot (it) { await this.mc.tossStack(it) }
+
+  async lookDown () { try { await this.mc.look(this.mc.entity.yaw, -Math.PI / 2, true) } catch {} }
+
+  // before dropping for your main: back off ~2 blocks and look at your feet
+  async prepareDrop (mainName) {
+    const bot = this.mc
+    const name = Object.keys(bot.players || {}).find(n => n.toLowerCase() === String(mainName).toLowerCase())
+    const main = name && bot.players[name].entity
+    if (main) await bot.lookAt(main.position.offset(0, 1.6, 0), true)
+    bot.setControlState('back', true)
+    await sleep(500)
+    bot.setControlState('back', false)
+    await sleep(250)
+    const target = main ? main.position.offset(0, 0.4, 0) : null
+    if (target) await bot.lookAt(target, true)
+    else await this.lookDown()
+    this.dropAtFeet = !target
+    await sleep(400) // the new direction has to reach the server before the first throw
+  }
+
+  // dropped at its own feet (main not in sight): walk off so it doesn't pick them up again
+  async afterDrop () {
+    if (!this.dropAtFeet) return
+    const bot = this.mc
+    bot.setControlState('back', true)
+    await sleep(900)
+    bot.setControlState('back', false)
+  }
+
+  // [{ slot, name, count, customName, customLore }] for the main inventory
+  inventoryItems () {
+    try { return this.mc && this.mc.inventory ? this.mc.inventory.items() : [] } catch { return [] }
+  }
+
+  // every few seconds (server.js): one shard per full minute in the AFK area;
+  // leaving the area or the game starts the minute over
+  afkTick () {
+    const now = Date.now()
+    if (this.status !== 'online' || !this.inAfk()) {
+      if (this.afkSince) { this.afkSince = 0; this.changed() }
+      return
+    }
+    if (this.cfg.shards == null) this.syncBoard(this.boardReading())
+    if (!this.afkSince) { this.afkSince = now; this.changed(); return }
+    let got = 0
+    while (now - this.afkSince >= 60000) { this.afkSince += 60000; got++ }
+    if (!got) return
+    const t = this.cfg.tally || (this.cfg.tally = { earned: 0, day: '', today: 0, spent: 0, bought: {}, disconnects: 0, lastShardAt: 0 })
+    if (t.day !== today()) { t.day = today(); t.today = 0 }
+    t.earned += got
+    t.today += got
+    t.lastShardAt = now
+    addDay('earned', got)
+    this.cfg.shards = (this.cfg.shards || 0) + got
+    this.stats.shards = this.cfg.shards
+    save()
+    this.changed()
+  }
+
+  // always: run /shards every minute without waiting for the scoreboard (Bedrock bots)
+  watchShards (conn, always) {
+    this.boardShards = false
+    this.shardsAsked = 0
+    this.timer(setTimeout(() => {
+      if (conn !== this.conn || (this.boardShards && !always)) return
+      if (!always) this.write('info', 'No shards on the scoreboard, so the bot checks /shards every minute.')
+      const ask = () => {
+        if (conn !== this.conn || (this.boardShards && !always) || this.status !== 'online' || this.busy) return
+        this.shardsAsked = Date.now()
+        this.sendLine('/shards', true)
+      }
+      ask()
+      this.timer(setInterval(ask, 60000))
+    }, always ? 8000 : 30000))
+  }
+
+  // a chat line right after /shards that mentions shards carries the number
+  checkShardsReply (text, motd) {
+    if (!this.shardsAsked || Date.now() - this.shardsAsked > 8000) return
+    const v = shardsFromChat(text, motd)
+    if (v !== null) {
+      this.shardsAsked = 0
+      // a rounded reply ("1.54K") only replaces the count when the count is clearly off
+      const val = shardValue(v)
+      if (/[kmbt]/i.test(String(v)) && val !== null && this.cfg.shards != null && Math.abs(this.cfg.shards - val) > Math.max(5, val * 0.006)) {
+        this.cfg.shards = Math.round(val)
+        save()
+      }
+      const n = this.syncBoard(v)
+      if (n !== this.stats.shards) { this.stats.shards = n; this.changed() }
+    }
+  }
+
+  reportScoreboard (info) {
+    try {
+      const key = JSON.stringify(info)
+      if (key === this.lastBoardReport || Date.now() - (this.lastBoardReportAt || 0) < 60000) return
+      this.lastBoardReport = key
+      this.lastBoardReportAt = Date.now()
+      fs.writeFileSync(path.join(DATA, 'scoreboard-report.json'), JSON.stringify({ when: new Date().toISOString(), server: this.cfg.host, edition: this.edition(), shards: this.stats.shards ?? null, ...info }, null, 2))
+    } catch {}
+  }
+
+  // What the HUD shows right now (drawn on screenshots)
+  hudState () {
+    const bot = this.mc
+    if (!bot) return null
+    const hotbar = []
+    for (let i = 0; i < 9; i++) {
+      const it = bot.inventory && bot.inventory.slots[(bot.inventory.hotbarStart ?? 36) + i]
+      hotbar.push(it ? { name: it.name, count: it.count } : null)
+    }
+    const mode = bot.game && bot.game.gameMode
+    return {
+      hotbar,
+      selected: bot.quickBarSlot || 0,
+      health: bot.health,
+      food: bot.food,
+      xpLevel: bot.experience ? bot.experience.level : 0,
+      xpProgress: bot.experience ? bot.experience.progress : 0,
+      survival: mode !== 'creative' && mode !== 'spectator',
+      actionBar: this.stats.actionBar && Date.now() - (this.actionBarAt || 0) < 4000 ? (this.actionBarMotd || this.stats.actionBar) : '',
+      sidebar: sidebarInfo(bot)
+    }
+  }
+
+  async screenshot () {
+    const meta = await shots.capture(this)
+    this.shot = meta
+    this.changed()
+    return meta
+  }
+
+  forgetAccount () {
+    fs.rmSync(path.join(DATA, 'auth', this.cfg.id), { recursive: true, force: true })
+    this.cfg.account = ''
+    save()
+    this.changed()
+  }
+
+  // ---- connection ---------------------------------------------------------
+
+  async connect () {
+    const conn = ++this.conn
+    this.ended = false
+    this.setStatus('connecting', `Connecting to ${this.cfg.host}`)
+    let { host } = this.cfg
+    let port = Number(this.cfg.port) || 25565
+    let proxy = null
+    try { proxy = proxyForBot(this.cfg) } catch (e) {
+      this.cfg.running = false
+      save()
+      return this.setStatus('error', `The group's proxy is wrong: ${e.message}`)
+    }
+    let connectVia
+    if (proxy) {
+      // the proxy can't look up Minecraft's SRV records, so do that first
+      if (port === 25565 && !require('net').isIP(host)) {
+        try {
+          const srv = await require('dns').promises.resolveSrv(`_minecraft._tcp.${host}`)
+          if (srv[0]) { host = srv[0].name; port = srv[0].port }
+        } catch {}
+      }
+      this.write('info', `Connecting through ${proxyLib.describe(proxy)}`)
+      connectVia = (client) => {
+        proxyLib.tcpConnect(proxy, host, port).then(sock => {
+          client.setSocket(sock)
+          client.emit('connect')
+        }).catch(e => client.emit('error', new Error(`Proxy: ${e.message}`)))
+      }
+    }
+    let version
+    try {
+      const picked = await pickVersion(host, port, this.cfg.version, connectVia)
+      version = picked.version
+      if (picked.note) this.write('info', picked.note)
+    } catch (e) {
+      if (conn !== this.conn) return
+      this.write('error', `Couldn't reach ${host}: ${netError(e)}`)
+      return this.afterEnd(`Couldn't reach ${host}`, 'network')
+    }
+    if (conn !== this.conn || !this.cfg.running) return
+
+    const isMs = this.cfg.auth === 'microsoft'
+    if (!isMs && !/^[A-Za-z0-9_]{3,16}$/.test(this.cfg.name)) {
+      this.setStatus('error', 'Offline names must be 3 to 16 letters, numbers or underscores.')
+      this.cfg.running = false
+      save()
+      return
+    }
+    let bot
+    try {
+      bot = mineflayer.createBot({
+        host,
+        port,
+        version,
+        auth: isMs ? 'microsoft' : 'offline',
+        username: isMs ? `golem-${this.cfg.id}` : this.cfg.name,
+        profilesFolder: path.join(DATA, 'auth', this.cfg.id),
+        onMsaCode: data => this.onCode(data, conn),
+        hideErrors: true,
+        respawn: true,
+        ...(connectVia ? { connect: connectVia } : {}),
+        checkTimeoutInterval: 60000
+      })
+    } catch (e) {
+      this.write('error', e.message || String(e))
+      return this.afterEnd(e.message || String(e), 'network')
+    }
+    this.mc = bot
+    this.spawned = false
+    this.kickText = ''
+    bot.loadPlugin(pathfinder)
+    bot.golemSidebar = trackSidebar(bot._client)
+    // most servers send action bar text in its own packet, which mineflayer doesn't report
+    bot._client.on('action_bar', (p) => {
+      if (conn !== this.conn) return
+      try {
+        const Chat = require('prismarine-chat')(bot.registry)
+        let raw = p.text
+        if (typeof raw === 'string') { try { raw = JSON.parse(raw) } catch {} }
+        const msg = typeof raw === 'object' && Chat.fromNotch ? Chat.fromNotch(raw) : new Chat(raw)
+        this.setActionBar(msg.toString().trim(), msg.toMotd())
+      } catch {}
+    })
+
+    bot._client.once('connect', () => {
+      if (conn !== this.conn) return
+      if (this.status === 'signin') this.setStatus('connecting', `Joining ${host}`)
+      this.timer(setTimeout(() => {
+        if (conn === this.conn && !this.spawned) {
+          this.write('error', 'Joined but never got into the world. Trying again.')
+          try { bot.end('timeout') } catch {}
+        }
+      }, 90000))
+    })
+
+    bot.once('login', () => {
+      if (isMs && bot.username && bot.username !== this.cfg.account) {
+        this.cfg.account = bot.username
+        save()
+      }
+      this.write('info', `Logged in as ${bot.username} (${version})`)
+    })
+
+    bot.on('spawn', () => {
+      if (conn !== this.conn) return
+      if (!this.spawned) {
+        this.spawned = true
+        this.onlineSince = Date.now()
+        addHistory(this.cfg.id, 'on')
+        const wasDown = this.downSince
+        this.downSince = 0
+        this.setStatus('online')
+        this.write('info', `In the world on ${host}`)
+        if (wasDown && Date.now() - wasDown > 60000) {
+          alert('backOnline', { bot: this, title: 'Back online', text: `Down for ${ago(Date.now() - wasDown)}.`, tone: 'good' })
+        }
+        this.timer(setTimeout(() => { if (conn === this.conn) this.fails = 0 }, 120000))
+        this.onJoined(conn)
+      }
+      this.updateStats()
+    })
+
+    bot.on('message', (msg, position, senderUuid) => {
+      if (conn !== this.conn) return
+      if (position === 'game_info') {
+        this.setActionBar(msg.toString().trim(), msg.toMotd())
+        return
+      }
+      const text = msg.toString()
+      if (!text.trim()) return
+      let known = null
+      if (senderUuid) {
+        const p = Object.values(bot.players).find(pl => pl.uuid === senderUuid)
+        if (p) known = p.username
+      }
+      const found = findSender(text, Object.keys(bot.players), known)
+      const motd = msg.toMotd()
+      this.checkShardsReply(text, motd)
+      if (found) this.write('chat', text.slice(found.cut), sliceMotd(motd, found.cut), found.from)
+      else this.write(position === 'chat' ? 'chat' : 'server', text, motd)
+      this.checkMention(text, bot)
+    })
+
+    bot.on('health', () => {
+      if (conn !== this.conn) return
+      const prev = this.stats.health
+      this.updateStats()
+      const low = Number(config.settings.lowHealth) || 6
+      if (typeof prev === 'number' && prev > low && bot.health <= low && bot.health > 0) {
+        alert('lowHealth', { bot: this, title: 'Low health', text: `Health is down to ${hearts(bot.health)}.`, tone: 'warn' })
+      }
+    })
+
+    bot.on('death', () => {
+      if (conn !== this.conn) return
+      this.write('error', 'Died. Respawning.')
+      alert('died', { bot: this, title: 'Died', text: 'The bot died and respawned.', tone: 'bad' })
+    })
+
+    bot.on('kicked', (reason) => {
+      if (conn !== this.conn) return
+      this.kickText = this.readReason(reason, bot)
+      this.write('error', `Kicked: ${this.kickText}`)
+    })
+
+    bot.on('error', (err) => {
+      if (conn !== this.conn) return
+      const text = (err && err.message) || String(err)
+      this.lastError = text
+      this.write('error', text)
+      // some errors (sign-in) never fire 'end'
+      setTimeout(() => { if (conn === this.conn && !this.ended) { try { bot.end('error') } catch {} this.handleEnd(conn, text) } }, 3000)
+    })
+
+    bot.on('end', (reason) => this.handleEnd(conn, reason))
+  }
+
+  onCode (data, conn) {
+    if (conn !== this.conn) return
+    this.msa = {
+      code: data.user_code,
+      url: data.verification_uri || 'https://www.microsoft.com/link',
+      expires: Date.now() + (data.expires_in || 900) * 1000
+    }
+    this.status = 'signin'
+    this.detail = 'Waiting for you to sign in to Microsoft'
+    this.changed()
+    this.write('info', `Sign in at ${this.msa.url} with code ${this.msa.code}`)
+    alert('signIn', {
+      bot: this,
+      title: 'Needs you to sign in',
+      text: `Open ${this.msa.url} and enter **${this.msa.code}** with the Microsoft account this bot uses.`,
+      tone: 'warn'
+    })
+  }
+
+  handleEnd (conn, reason) {
+    if (conn !== this.conn || this.ended) return
+    this.ended = true
+    const kick = this.kickText
+    const err = this.lastError
+    this.lastError = ''
+    this.finish(kick ? 'kicked' : 'ended')
+    if (this.stopReason) {
+      const why = this.stopReason
+      this.stopReason = ''
+      this.setStatus('stopped', why === 'Stopped' ? '' : why)
+      return
+    }
+    if (this.restarting) {
+      this.restarting = false
+      this.write('info', 'Restarting')
+      return this.connect()
+    }
+    if (this.cfg.tally) { this.cfg.tally.disconnects = (this.cfg.tally.disconnects || 0) + 1; save() }
+    addDay('disconnects')
+    if (kick) {
+      this.lastKick = kick
+      return this.afterEnd(kick, 'kick')
+    }
+    const text = err || (typeof reason === 'string' && reason !== 'socketClosed' ? reason : 'Lost connection')
+    this.write('error', `Disconnected: ${text}`)
+    this.afterEnd(text, authError(text) ? 'auth' : 'network')
+  }
+
+  finish () {
+    this.clearTimers()
+    this.stopMacro(true)
+    const bot = this.mc
+    this.mc = null
+    this.stats = {}
+    if (this.spawned && !this.downSince) this.downSince = Date.now()
+    this.spawned = false
+    addHistory(this.cfg.id, 'off')
+    if (bot) { try { bot.removeAllListeners() } catch {} this.closeClient(bot) }
+  }
+
+  afterEnd (text, kind) {
+    if (!this.cfg.running) return this.setStatus('stopped')
+    if (kind === 'kick' && /another location|duplicate.?login|logged in from another|logged in elsewhere/i.test(text)) {
+      if (this.cfg.reconnect.onDuplicate === 'wait') {
+        this.cfg.running = false
+        save()
+        this.setStatus('paused', 'You logged in on this account somewhere else, so the bot stepped aside. Press Start when you are done playing.')
+        alert('kicked', { bot: this, title: 'Paused', text: 'This account logged in somewhere else, so the bot stepped aside. Start it again from the dashboard when you are done.', tone: 'warn' })
+        return
+      }
+      return this.scheduleReconnect(text, 30 * 60)
+    }
+    if (kind === 'kick' && /\bbanned\b|not white-?listed/i.test(text)) {
+      this.cfg.running = false
+      save()
+      this.setStatus('error', text)
+      alert('stopped', { bot: this, title: 'Stopped for good', text, tone: 'bad' })
+      return
+    }
+    if (kind === 'auth') {
+      this.cfg.running = false
+      save()
+      this.setStatus('error', friendlyAuth(text))
+      alert('stopped', { bot: this, title: "Couldn't sign in", text: friendlyAuth(text), tone: 'bad' })
+      return
+    }
+    // a server restart: wait it out, then rejoin one at a time (AfkBot.restartSlot is set by server.js)
+    if (/restart|reboot|shutting down|server (is )?(closing|stopping)|server closed/i.test(text) && this.cfg.reconnect.on) {
+      const wait = Math.max(20, Number(config.settings.restartWait) || 90) + (AfkBot.restartSlot ? AfkBot.restartSlot() : 0)
+      this.write('info', `The server is restarting. Rejoining in ${wait} seconds.`)
+      return this.scheduleReconnect(text, wait)
+    }
+    if (kind === 'kick') alert('kicked', { bot: this, title: 'Kicked', text, tone: 'bad' })
+    if (!this.cfg.reconnect.on) {
+      this.cfg.running = false
+      save()
+      this.setStatus('stopped', text)
+      alert('stopped', { bot: this, title: 'Stopped', text: `${text}\nAuto-reconnect is off.`, tone: 'bad' })
+      return
+    }
+    this.scheduleReconnect(text)
+  }
+
+  scheduleReconnect (text, fixedSeconds) {
+    const base = Math.max(5, Number(this.cfg.reconnect.delay) || 15)
+    const seconds = fixedSeconds || Math.min(300, base * Math.pow(2, Math.min(this.fails, 5)))
+    this.fails++
+    this.nextTry = Date.now() + seconds * 1000
+    this.setStatus('waiting', text)
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = setTimeout(() => {
+      this.nextTry = 0
+      if (this.cfg.running && !this.mc) this.connect()
+    }, seconds * 1000)
+  }
+
+  // ---- while online -------------------------------------------------------
+
+  timer (t) { this.timers.push(t); return t }
+  clearTimers () {
+    clearTimeout(this.shotTimer)
+    for (const t of this.timers) { clearTimeout(t); clearInterval(t) }
+    this.timers = []
+    this.eating = false
+  }
+
+  onJoined (conn) {
+    const bot = this.mc
+    try {
+      const moves = new Movements(bot)
+      moves.canDig = false
+      moves.allow1by1towers = false
+      moves.scafoldingBlocks = []
+      moves.allowParkour = true
+      bot.pathfinder.setMovements(moves)
+    } catch {}
+    this.timer(setInterval(() => this.tick(conn), 2000))
+    this.scheduleShots(conn)
+    const auto = (this.cfg.macros || []).find(m => m.onJoin && m.steps.length)
+    if (auto) this.timer(setTimeout(() => { if (conn === this.conn && !this.macro) this.playMacro(auto.id) }, this.cfg.joinCommands.trim() ? 8000 : 3000))
+    if (this.cfg.joinCommands.trim()) {
+      this.timer(setTimeout(() => this.runCommands(this.cfg.joinCommands, conn, 'join'), 1500))
+    }
+    this.scheduleAfk(conn)
+    if (this.cfg.repeat.on && this.cfg.repeat.commands.trim()) {
+      const every = Math.max(0.5, Number(this.cfg.repeat.every) || 10) * 60000
+      this.timer(setInterval(() => this.runCommands(this.cfg.repeat.commands, conn, 'repeat'), every))
+    }
+    return bot
+  }
+
+  // Screenshots every settings.screenshotSeconds (1 s to 45 min, 0 = only on request).
+  // Reads the setting each time, so a change applies right away. A bot never queues a
+  // new picture while its last one is still being drawn.
+  scheduleShots (conn) {
+    const next = (ms) => { clearTimeout(this.shotTimer); this.shotTimer = setTimeout(take, ms) }
+    const take = async () => {
+      if (conn !== this.conn) return
+      const every = Number(config.settings.screenshotSeconds) || 0
+      if (!every) return next(5000)
+      const t0 = Date.now()
+      if (this.status === 'online' && !this.shooting) {
+        this.shooting = true
+        try { await this.screenshot() } catch (e) { if (!this.shotError) { this.shotError = true; this.write('error', `Screenshot failed: ${e.message}`) } }
+        this.shooting = false
+      }
+      if (conn === this.conn) next(Math.max(250, every * 1000 - (Date.now() - t0)))
+    }
+    next(6000)
+  }
+
+  scheduleAfk (conn) {
+    const afk = this.cfg.antiAfk
+    if (!afk.on || !afk.actions.length) return
+    const every = Math.max(5, Number(afk.every) || 30) * 1000
+    const wait = every * (0.7 + Math.random() * 0.6)
+    this.timer(setTimeout(async () => {
+      if (conn !== this.conn || !this.mc || this.busy) return this.scheduleAfk(conn)
+      const pick = afk.actions[Math.floor(Math.random() * afk.actions.length)]
+      try { if (ANTI_AFK[pick]) await ANTI_AFK[pick](this.mc) } catch {}
+      if (conn === this.conn) this.scheduleAfk(conn)
+    }, wait))
+  }
+
+  tick (conn) {
+    if (conn !== this.conn || !this.mc) return
+    this.updateStats()
+    const sb = sidebarInfo(this.mc)
+    if (sb) this.reportScoreboard({ objectives: [...(this.mc.golemSidebar.objectives.keys())], shown: this.mc.golemSidebar.shown, ...sb })
+    const bot = this.mc
+    if (this.cfg.autoEat && !this.eating && !this.busy && bot.food <= 14) this.eat(bot, conn)
+  }
+
+  async eat (bot, conn) {
+    const foods = bot.registry.foodsByName || {}
+    const skip = new Set(['rotten_flesh', 'spider_eye', 'poisonous_potato', 'pufferfish', 'chorus_fruit', 'suspicious_stew'])
+    const item = bot.inventory.items().find(i => foods[i.name] && !skip.has(i.name))
+    if (!item) return
+    this.eating = true
+    try {
+      await bot.equip(item, 'hand')
+      await bot.consume()
+      if (conn === this.conn) this.write('info', `Ate ${item.displayName}`)
+    } catch { /* full or interrupted */ }
+    this.eating = false
+  }
+
+  updateStats () {
+    const bot = this.mc
+    if (!bot || !bot.entity) return
+    const p = bot.entity.position
+    const next = {
+      health: typeof bot.health === 'number' ? Math.round(bot.health * 10) / 10 : null,
+      food: typeof bot.food === 'number' ? bot.food : null,
+      x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z),
+      dimension: String(bot.game && bot.game.dimension || '').replace('minecraft:', ''),
+      ping: bot.player ? bot.player.ping : null,
+      players: Object.keys(bot.players || {}).length,
+      actionBar: this.stats.actionBar || '',
+      shards: this.syncBoard(readSidebarShards(bot))
+    }
+    if (JSON.stringify(next) !== JSON.stringify(this.stats)) {
+      this.stats = next
+      this.changed()
+    }
+  }
+
+  // Join / repeat commands. Lines:  /cmd or text | wait 5 | slot 3 | use | click Name | close
+  async runCommands (text, conn, why) {
+    if (this.busy) return
+    this.busy = true
+    const lines = String(text).split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+    try {
+      for (const line of lines) {
+        if (conn !== this.conn || !this.mc) break
+        const bot = this.mc
+        const [word, ...rest] = line.split(/\s+/)
+        const arg = rest.join(' ')
+        const w = word.toLowerCase()
+        if (w === 'wait') {
+          await sleep(Math.min(600, Math.max(0, parseFloat(arg) || 1)) * 1000)
+          continue
+        }
+        if (w === 'slot') {
+          const n = parseInt(arg, 10)
+          if (n >= 1 && n <= 9) bot.setQuickBarSlot(n - 1)
+        } else if (w === 'use') {
+          bot.activateItem()
+          await sleep(200)
+          bot.deactivateItem()
+        } else if (w === 'close') {
+          if (bot.currentWindow) bot.closeWindow(bot.currentWindow)
+        } else if (w === 'click') {
+          await this.clickItem(bot, arg)
+        } else {
+          this.sendLine(line)
+        }
+        await sleep(900)
+      }
+    } catch (e) {
+      this.write('error', `${why === 'join' ? 'Join' : 'Repeat'} commands stopped: ${e.message || e}`)
+    }
+    this.busy = false
+  }
+
+  async clickItem (bot, wanted) {
+    const want = wanted.toLowerCase()
+    const until = Date.now() + 10000
+    while (Date.now() < until) {
+      const win = bot.currentWindow
+      if (win) {
+        const slots = win.slots.slice(0, win.inventoryStart)
+        const slot = slots.findIndex(item => item && itemText(item, bot).toLowerCase().includes(want))
+        if (slot >= 0) {
+          await bot.clickWindow(slot, 0, 0)
+          this.write('info', `Clicked "${wanted}"`)
+          return
+        }
+      }
+      await sleep(250)
+    }
+    this.write('error', `No menu item called "${wanted}" showed up.`)
+  }
+
+  // ---- macros -------------------------------------------------------------
+
+  // the bot's own macros first, then the ones for every bot (Macros tab)
+  findMacro (id) {
+    const own = (this.cfg.macros || []).find(x => x.id === id)
+    if (own) return { m: own, global: false }
+    const all = (config.macros || []).find(x => x.id === id)
+    return all ? { m: all, global: true } : { m: null, global: false }
+  }
+
+  playMacro (id) {
+    const { m, global } = this.findMacro(id)
+    if (!m) throw new Error('That macro is gone.')
+    if (this.job && this.job.state === 'running') throw new Error('The bot is buying from the shop. Stop that first.')
+    if (!this.mc || this.status !== 'online') throw new Error('The bot has to be online to play a macro.')
+    if (!m.steps.length) throw new Error('This macro has no steps yet.')
+    this.stopMacro(true)
+    const run = { id: m.id, step: 0, loops: 0, token: {}, name: m.name, steps: m.steps.length, global }
+    this.macro = run
+    this.busy = true
+    this.write('info', `Playing macro "${m.name}"`)
+    this.changed()
+    this.runMacro(m, run).then(() => {
+      if (this.macro === run) this.write('info', `Macro "${m.name}" finished`)
+    }).catch(e => {
+      if (this.macro === run && !run.token.cancelled) this.write('error', `Macro "${m.name}" stopped: ${e.message}`)
+    }).finally(() => {
+      if (this.macro === run) {
+        this.macro = null
+        this.busy = false
+        this.changed()
+      }
+    })
+  }
+
+  stopMacro (quiet) {
+    const run = this.macro
+    if (!run) return
+    run.token.cancelled = true
+    this.macro = null
+    this.busy = false
+    const bot = this.mc
+    if (bot) {
+      try { bot.pathfinder.stop() } catch {}
+      try { bot.clearControlStates() } catch {}
+    }
+    if (!quiet) { this.write('info', 'Macro stopped'); this.changed() }
+  }
+
+  async runMacro (m, run) {
+    do {
+      for (let i = 0; i < m.steps.length; i++) {
+        if (run.token.cancelled || this.macro !== run) return
+        run.step = i
+        this.changed()
+        await this.doStep(m.steps[i], run.token)
+        await sleep(250)
+      }
+      run.loops++
+    } while (m.loop && !run.token.cancelled && this.macro === run)
+  }
+
+  async doStep (step, token) {
+    const bot = this.mc
+    if (!bot) throw new Error('Disconnected')
+    switch (step.type) {
+      case 'move': return this.moveTo(step, token)
+      case 'wait': return cancellableSleep(Math.min(3600, Math.max(0, Number(step.seconds) || 1)) * 1000, token)
+      case 'chat': if (step.text) this.sendLine(String(step.text).slice(0, 256)); return
+      case 'look': {
+        const l = LOOK[step.dir] || LOOK.north
+        return bot.look(l[0] === null ? bot.entity.yaw : l[0], l[1], true)
+      }
+      case 'slot': { const n = parseInt(step.slot, 10); if (n >= 1 && n <= 9) bot.setQuickBarSlot(n - 1); return }
+      case 'use': bot.activateItem(); await sleep(200); bot.deactivateItem(); return
+      case 'useBlock': {
+        const b = bot.blockAtCursor(5)
+        if (!b) throw new Error("There's no block in front of the bot to right-click.")
+        return bot.activateBlock(b)
+      }
+      case 'click': return this.clickItem(bot, String(step.name || ''))
+      case 'close': if (bot.currentWindow) bot.closeWindow(bot.currentWindow); return
+      case 'jump': return hold(bot, 'jump', 400)
+      case 'sneak': return hold(bot, 'sneak', Math.min(60, Math.max(0.2, Number(step.seconds) || 1)) * 1000)
+      case 'attack': {
+        const target = bot.nearestEntity(e => e !== bot.entity && e.type !== 'player' && e.type !== 'object' && e.type !== 'orb' && e.name !== 'item' && e.position.distanceTo(bot.entity.position) < 4.5)
+        if (target) { await bot.lookAt(target.position.offset(0, (target.height || 1) * 0.8, 0), true); bot.attack(target) }
+        return
+      }
+    }
+  }
+
+  async moveTo (step, token) {
+    const bot = this.mc
+    const x = Number(step.x)
+    const z = Number(step.z)
+    const hasY = step.y !== '' && step.y !== null && step.y !== undefined && Number.isFinite(Number(step.y))
+    if (!Number.isFinite(x) || !Number.isFinite(z)) throw new Error('Move to needs an X and a Z.')
+    const goal = hasY ? new goals.GoalNear(x, Number(step.y), z, 1) : new goals.GoalNearXZ(x, z, 1)
+    const where = hasY ? `${x}, ${step.y}, ${z}` : `${x}, ${z}`
+    this.write('info', `Walking to ${where}`)
+    let best = Infinity
+    let lastBetter = Date.now()
+    const watch = setInterval(() => {
+      if (!this.mc) return
+      const p = this.mc.entity.position
+      const d = Math.hypot(p.x - x, (hasY ? p.y - Number(step.y) : 0), p.z - z)
+      if (d < best - 0.5) { best = d; lastBetter = Date.now() }
+      if (token.cancelled || Date.now() - lastBetter > 30000) { try { this.mc.pathfinder.stop() } catch {} }
+    }, 1000)
+    try {
+      await bot.pathfinder.goto(goal)
+    } catch (e) {
+      if (token.cancelled) return
+      if (Date.now() - lastBetter > 30000) throw new Error(`Couldn't get to ${where} (stuck for 30 seconds)`)
+      throw new Error(`Couldn't get to ${where}: ${e.message}`)
+    } finally {
+      clearInterval(watch)
+    }
+  }
+
+  checkMention (text, bot) {
+    const words = String(config.settings.keywords || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    if (bot.username) words.push(bot.username.toLowerCase())
+    const low = text.toLowerCase()
+    if (bot.username && low.startsWith(`<${bot.username.toLowerCase()}>`)) return
+    if (words.some(w => w.length >= 3 && low.includes(w))) {
+      alert('mentioned', { bot: this, title: 'Mentioned in chat', text: '`' + text.replace(/`/g, "'").slice(0, 500) + '`', tone: 'info' })
+    }
+  }
+
+  readReason (reason, bot) {
+    try {
+      const Chat = require('prismarine-chat')(bot.registry)
+      if (typeof reason === 'string') {
+        try { return new Chat(JSON.parse(reason)).toString() || reason } catch { return reason }
+      }
+      if (Chat.fromNotch) return Chat.fromNotch(reason).toString()
+      return new Chat(reason).toString()
+    } catch {
+      return typeof reason === 'string' ? reason : JSON.stringify(reason)
+    }
+  }
+}
+
+// The scoreboard on the right. Tracked from the raw packets because mineflayer
+// ignores score updates on Minecraft 1.20.3 and newer.
+function trackSidebar (client) {
+  const sb = { shown: null, objectives: new Map() } // objective -> Map(entry -> { value, display })
+  const of = (name) => { let m = sb.objectives.get(name); if (!m) { m = new Map(); sb.objectives.set(name, m) } return m }
+  client.on('scoreboard_display_objective', (p) => { if (p.position === 1) sb.shown = p.name })
+  sb.titles = new Map()
+  client.on('scoreboard_objective', (p) => {
+    if (p.action === 1) { sb.objectives.delete(p.name); return }
+    of(p.name)
+    if (p.displayText !== undefined) sb.titles.set(p.name, p.displayText)
+  })
+  client.on('scoreboard_score', (p) => {
+    if (p.action === 1) { of(p.scoreName).delete(p.itemName); return }
+    of(p.scoreName).set(p.itemName, { value: p.value, display: p.display_name })
+  })
+  client.on('reset_score', (p) => {
+    if (p.objective_name) of(p.objective_name).delete(p.entity_name)
+    else for (const m of sb.objectives.values()) m.delete(p.entity_name)
+  })
+  return sb
+}
+
+function sidebarLines (bot) {
+  const sb = bot.golemSidebar
+  if (!sb || !sb.shown) return []
+  const entries = sb.objectives.get(sb.shown)
+  if (!entries) return []
+  const Chat = require('prismarine-chat')(bot.registry)
+  return [...entries.entries()].sort((a, b) => b[1].value - a[1].value).map(([name, e]) => {
+    try {
+      if (e.display) return (Chat.fromNotch ? Chat.fromNotch(e.display) : new Chat(e.display)).toMotd()
+      const team = bot.teamMap && bot.teamMap[name]
+      if (team) return team.displayName(name).toMotd()
+    } catch {}
+    return name
+  })
+}
+
+function sidebarInfo (bot) {
+  const sb = bot.golemSidebar
+  if (!sb || !sb.shown) return null
+  let title = ''
+  try {
+    const raw = sb.titles && sb.titles.get(sb.shown)
+    if (raw !== undefined) {
+      const Chat = require('prismarine-chat')(bot.registry)
+      let msg = raw
+      if (typeof raw === 'string') { try { msg = JSON.parse(raw) } catch { msg = raw } }
+      title = (typeof msg === 'object' && Chat.fromNotch ? Chat.fromNotch(msg) : new Chat(msg)).toMotd()
+    }
+  } catch {}
+  return { title, lines: sidebarLines(bot) }
+}
+
+function spawnerLabel (it, afk) {
+  try {
+    const { textOf } = require('./donut')
+    const name = textOf(it.customName, afk.mc)
+    const lore = Array.isArray(it.customLore) ? it.customLore.map(l => textOf(l, afk.mc)).join(' ') : ''
+    const type = /type\s*:\s*([A-Za-z][A-Za-z _'-]*)/i.exec(lore)
+    if (type) return `${type[1].trim().replace(/\b[a-z]/g, c => c.toUpperCase())} spawner`
+    if (name && !/^spawner$/i.test(name.trim())) return name.trim()
+  } catch {}
+  return 'Spawner'
+}
+
+function readSidebarShards (bot) {
+  try { return parseShards(sidebarLines(bot)) } catch { return null }
+}
+
+function itemText (item, bot) {
+  const parts = [item.displayName, item.name]
+  let name = item.customName
+  if (name) {
+    try {
+      const Chat = require('prismarine-chat')(bot.registry)
+      if (typeof name === 'string' && name.trim().startsWith('{')) name = new Chat(JSON.parse(name)).toString()
+      else if (typeof name === 'object') name = (Chat.fromNotch ? Chat.fromNotch(name) : new Chat(name)).toString()
+    } catch {}
+    parts.unshift(stripCodes(name))
+  }
+  return parts.join(' ')
+}
+
+function netError (e) {
+  const inner = (e && Array.isArray(e.errors) && e.errors[0]) || e || {}
+  const code = inner.code || (e && e.code)
+  const known = {
+    ECONNREFUSED: 'the server refused the connection. It may be down or restarting.',
+    ETIMEDOUT: 'the connection timed out.',
+    ENOTFOUND: 'there is no server at that address. Check the spelling.',
+    EAI_AGAIN: 'this computer seems to be offline.',
+    ENETUNREACH: 'this computer seems to be offline.',
+    ECONNRESET: 'the server closed the connection.',
+    EHOSTUNREACH: 'the server could not be reached.'
+  }
+  if (known[code]) return known[code]
+  const msg = (inner && inner.message) || (e && e.message) || String(e)
+  return /ping timed out|timeout/i.test(msg) ? 'the server did not answer in time.' : msg
+}
+
+function authError (text) {
+  return /msa|xbox|xsts|microsoft|authenticat|does the account own|entitlement|profile not found|device code|expired_token|authorization_pending/i.test(text)
+}
+
+function friendlyAuth (text) {
+  if (/own|entitlement|profile not found/i.test(text)) return "This Microsoft account doesn't own Minecraft Java Edition, or has no profile name yet."
+  if (/expired|timed out|timeout/i.test(text)) return 'The sign-in code expired. Press Start to get a new one.'
+  return `Microsoft sign-in failed: ${text}`
+}
+
+function hearts (h) { return `${Math.round(h) / 2} hearts` }
+function ago (ms) {
+  const m = Math.round(ms / 60000)
+  if (m < 60) return `${m} min`
+  return `${Math.floor(m / 60)} h ${m % 60} min`
+}
+function sleep (ms) { return new Promise(r => setTimeout(r, ms)) }
+function cancellableSleep (ms, token) {
+  return new Promise(resolve => {
+    const end = Date.now() + ms
+    const t = setInterval(() => { if (token.cancelled || Date.now() >= end) { clearInterval(t); resolve() } }, 100)
+  })
+}
+
+AfkBot.gate = null
+
+module.exports = { AfkBot, SUPPORTED, NEWEST, STEP_TYPES, stripCodes, findSender, sliceMotd, sleep, ago, hearts, friendlyAuth, authError, netError }

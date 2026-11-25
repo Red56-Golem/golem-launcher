@@ -1,0 +1,68 @@
+'use strict'
+// "Send to main": the bot asks your main account for a teleport (/tpa <main>), waits for
+// you to accept, drops every spawner it holds next to you, then goes back to the AFK area.
+const { config, human } = require('./store')
+
+function sleep (ms) { return new Promise(r => setTimeout(r, ms)) }
+function far (a, b) {
+  if (!a || !b) return false
+  if (a.dim !== b.dim) return true
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) > 8
+}
+
+async function sendToMain (afk) {
+  const main = String(config.settings.mainName || '').trim()
+  if (!/^[A-Za-z0-9_ .]{2,32}$/.test(main)) throw new Error('Put your main account\'s name in Settings first.')
+  if (afk.status !== 'online') throw new Error('The account has to be online.')
+  if (afk.busy || (afk.job && afk.job.state === 'running')) throw new Error('The account is busy. Try again in a moment.')
+  if (!afk.stash().total) throw new Error('It has no spawners to send.')
+  const token = {}
+  const job = { kind: 'send', mob: 'spawner', amount: afk.stash().total, bought: 0, state: 'running', text: `Asking ${main} for a teleport`, token }
+  afk.job = job
+  afk.busy = true
+  afk.changed()
+  const start = afk.position()
+  try {
+    afk.sendLine(`/tpa ${main}`)
+    job.text = `Waiting for you to /tpaccept on ${main}`
+    afk.changed()
+    const until = Date.now() + 90000
+    while (!far(start, afk.position())) {
+      if (token.cancelled) throw new Error('Stopped')
+      if (afk.status !== 'online') throw new Error('Disconnected')
+      if (Date.now() > until) throw new Error(`${main} didn't accept the teleport within 90 seconds`)
+      await sleep(500)
+    }
+    job.text = 'Teleported. Dropping spawners'
+    afk.changed()
+    await sleep(human(1500, 3000))
+    // step back from you and aim at your feet, so you pick them up and the bot doesn't
+    await afk.prepareDrop(main)
+    let dropped = 0
+    for (const it of afk.inventoryItems().filter(i => i && /spawner/i.test(i.name))) {
+      if (token.cancelled) throw new Error('Stopped')
+      await afk.dropSlot(it)
+      dropped += it.count
+      await sleep(human(300, 800))
+    }
+    await afk.afterDrop()
+    job.bought = dropped
+    job.state = 'done'
+    job.text = `Dropped ${dropped} spawner${dropped === 1 ? '' : 's'} next to ${main}`
+    afk.write('info', `Shop: ${job.text}`)
+  } catch (e) {
+    job.state = token.cancelled ? 'stopped' : 'failed'
+    job.text = `Send to main: ${e.message}`
+    afk.write(token.cancelled ? 'info' : 'error', job.text)
+  } finally {
+    afk.busy = false
+    delete job.token
+    job.at = Date.now()
+    afk.changed()
+    // back to farming
+    const cmd = config.settings.afkCommand
+    if (cmd) setTimeout(() => { if (afk.status === 'online') { afk.lastAfkCmd = Date.now(); afk.sendLine(cmd) } }, human(2000, 5000))
+  }
+}
+
+module.exports = { sendToMain }

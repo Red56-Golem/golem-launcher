@@ -1,0 +1,354 @@
+'use strict'
+// OG Donut: buys spawners with shards through /shop -> Shards (Java and Bedrock bots).
+// The bot reads the menus like a player would: it finds the Shards button, then the
+// spawner whose lore says "Type: <mob>", then (if one opens) the confirm menu.
+// Every menu it sees is written to data/shop-report.json, so a changed shop can be fixed.
+const fs = require('fs')
+const path = require('path')
+const { DATA, config, save, addDay, human } = require('./store')
+
+// What the Shards page sold on 24 Nov 2026, in shop order. "Read prices" replaces these.
+const SPAWNERS = [
+  { mob: 'Pig', price: 250 },
+  { mob: 'Cow', price: 350 },
+  { mob: 'Zombie', price: 400 },
+  { mob: 'Spider', price: 750 },
+  { mob: 'Skeleton', price: 500 },
+  { mob: 'Creeper', price: 625 },
+  { mob: 'Zombified Piglin', price: 750 },
+  { mob: 'Iron Golem', price: 1500 }
+]
+
+const BOUGHT = /\b(bought|purchased|purchase (was )?successful|you (have )?received|successfully)\b/i
+const REFUSED = /not enough|insufficient|can'?t afford|cannot afford|don'?t have enough|do not have enough|inventory (is )?full|no (free )?space/i
+const MAX_ONE_BUY = 64
+
+function prices () {
+  const read = config.donut && Array.isArray(config.donut.prices) && config.donut.prices.length ? config.donut.prices : null
+  return { list: read || SPAWNERS, readAt: read ? config.donut.pricesAt : 0 }
+}
+
+function stripCodes (s) { return String(s || '').replace(/§#[0-9a-f]{6}/gi, '').replace(/§[0-9a-fk-orx]/gi, '') }
+
+// text components arrive as JSON strings, plain strings or NBT; returns plain text
+function textOf (raw, bot) {
+  if (raw === null || raw === undefined) return ''
+  try {
+    let v = raw
+    if (typeof v === 'object' && v.type && v.value !== undefined) v = require('prismarine-nbt').simplify(v)
+    if (typeof v === 'string') {
+      const t = v.trim()
+      if (t.startsWith('{') || t.startsWith('[') || t.startsWith('"')) { try { v = JSON.parse(t) } catch {} }
+    }
+    if (typeof v === 'string') return stripCodes(v)
+    const Chat = require('prismarine-chat')(bot.registry)
+    return stripCodes((Chat.fromNotch ? Chat.fromNotch(v) : new Chat(v)).toString())
+  } catch {
+    return typeof raw === 'string' ? stripCodes(raw) : ''
+  }
+}
+
+function itemInfo (item, bot) {
+  if (!item) return null
+  const lore = Array.isArray(item.customLore) ? item.customLore.map(l => textOf(l, bot)) : []
+  return { slot: item.slot, id: item.name, count: item.count, name: textOf(item.customName, bot) || item.displayName || item.name, lore }
+}
+
+function menuItems (win, bot) {
+  if (!win) return []
+  return win.slots.slice(0, win.inventoryStart).map(it => itemInfo(it, bot)).filter(Boolean)
+}
+
+// "250 shards" -> 250, "1.5k shards" -> 1500
+function priceFrom (text) {
+  const m = /(\d[\d,]*(?:\.\d+)?)\s*([kmb])?\s*shards?/i.exec(text)
+  if (!m) return null
+  return Math.round(parseFloat(m[1].replace(/,/g, '')) * ({ k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1))
+}
+
+function spawnersIn (win, bot) {
+  const out = []
+  for (const it of menuItems(win, bot)) {
+    if (it.id !== 'spawner' && !/spawner/i.test(it.name)) continue
+    const all = [it.name, ...it.lore].join('\n')
+    const type = /type\s*:\s*([A-Za-z][A-Za-z _'-]*)/i.exec(all)
+    if (!type) continue
+    out.push({ slot: it.slot, mob: titleCase(type[1].trim()), price: priceFrom(all) })
+  }
+  return out
+}
+
+function titleCase (s) { return s.toLowerCase().replace(/\b[a-z]/g, c => c.toUpperCase()) }
+
+function winSig (bot) {
+  const w = bot.currentWindow
+  if (!w) return 'none'
+  return w.id + '|' + w.slots.slice(0, w.inventoryStart).map(it => it ? `${it.name}:${it.count}:${JSON.stringify(it.customName || '')}` : '').join(',')
+}
+
+function sleep (ms) { return new Promise(r => setTimeout(r, ms)) }
+
+async function waitFor (test, ms, token) {
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    if (token && token.cancelled) throw new Error('Stopped')
+    const v = test()
+    if (v) return v
+    await sleep(100)
+  }
+  return null
+}
+
+// An "add more" button: "+16", "Add 16", "Increase by 16", or a green pane with a number on it
+function adderOf (it, confirmSlot) {
+  if (it.slot === confirmSlot || it.id === 'spawner') return null
+  const m = /(?:^|\s)\+\s*(\d+)\b|\b(?:add|increase(?:\s+by)?|more)\s+(\d+)\b/i.exec(it.name)
+  if (m) return { slot: it.slot, n: Number(m[1] || m[2]) }
+  if (/^(lime|green)_stained_glass(_pane)?$/.test(it.id) && !/^-|\b(remove|decrease|less|minus)\b/i.test(it.name)) {
+    const k = /(\d+)/.exec(it.name)
+    if (k) return { slot: it.slot, n: Number(k[1]) }
+  }
+  return null
+}
+
+class Shopper {
+  constructor (afk, token) {
+    this.afk = afk
+    // Bedrock bots hand over a small stand-in with the same menu functions
+    this.bot = afk.menuBot ? afk.menuBot() : afk.mc
+    this.token = token
+    this.seen = []
+  }
+
+  report (step, extra) {
+    const bot = this.bot
+    const w = bot.currentWindow
+    this.seen.push({ step, when: new Date().toISOString(), title: w ? textOf(w.title, bot) : null, window: w ? w.type : null, items: menuItems(w, bot), ...(extra || {}) })
+    if (this.seen.length > 20) this.seen.shift()
+    try {
+      fs.writeFileSync(path.join(DATA, 'shop-report.json'), JSON.stringify({ bot: this.afk.displayName(), server: this.afk.cfg.host, seen: this.seen }, null, 2))
+    } catch {}
+  }
+
+  chatAfter (mark, re) {
+    // only server lines: players chatting "bought" must not count
+    return this.afk.log.find(l => l.n > mark && l.kind === 'server' && re.test(l.text))
+  }
+
+  async click (slot) {
+    if (this.token.cancelled) throw new Error('Stopped')
+    await sleep(human(80, 420)) // a person doesn't click at machine speed
+    await this.bot.clickWindow(slot, 0, 0)
+  }
+
+  // ends with the Shards page open
+  async openShards () {
+    const bot = this.bot
+    if (spawnersIn(bot.currentWindow, bot).length) return
+    if (bot.currentWindow) { bot.closeWindow(bot.currentWindow); await sleep(400) }
+    const before = winSig(bot)
+    this.afk.sendLine('/shop', true)
+    const opened = await waitFor(() => bot.currentWindow && winSig(bot) !== before, 7000, this.token)
+    if (!opened) throw new Error('/shop did not open a menu.')
+    await sleep(500)
+    this.report('after /shop')
+    if (spawnersIn(bot.currentWindow, bot).length) return
+    const items = menuItems(bot.currentWindow, bot)
+    const btn = items.find(it => /\bshards?\b/i.test(it.name)) || items.find(it => it.id === 'amethyst_shard')
+    if (!btn) throw new Error('No Shards button in the /shop menu.')
+    await this.click(btn.slot)
+    const ok = await waitFor(() => spawnersIn(bot.currentWindow, bot).length, 7000, this.token)
+    await sleep(300)
+    this.report('after Shards')
+    if (!ok) throw new Error('The Shards page did not show any spawners.')
+  }
+
+  // Clicks "+N" buttons until the menu shows `want` (or as close as it gets). Returns the amount shown.
+  async setAmount (want) {
+    const bot = this.bot
+    const shown = () => {
+      const sp = menuItems(bot.currentWindow, bot).find(it => it.id === 'spawner')
+      return sp ? sp.count : null
+    }
+    let cur = shown() || 1
+    if (want <= cur) return cur
+    const confirm = this.confirmSlot()
+    const adders = menuItems(bot.currentWindow, bot)
+      .map(it => adderOf(it, confirm))
+      .filter(a => a && a.n > 0).sort((a, b) => b.n - a.n)
+    for (let guard = 0; cur < want && guard < 40; guard++) {
+      const step = adders.find(a => cur + a.n <= want)
+      if (!step) break
+      const was = cur
+      await this.click(step.slot)
+      await waitFor(() => shown() !== was, 1500, this.token)
+      const now = shown()
+      if (now === null || now === was) break
+      cur = now
+    }
+    return cur
+  }
+
+  // Donut's CONFIRM PURCHASE menu (24 Nov screenshot): red panes on the left, the spawner in
+  // the middle, green panes on the right (amounts) and a lime pane named CONFIRM ("Click to buy")
+  // under them. The named button wins; a plain lime/green pane without a number is the fallback.
+  confirmSlot () {
+    const items = menuItems(this.bot.currentWindow, this.bot)
+    const named = items.find(it => /\b(confirm|buy|purchase|accept|yes)\b/i.test(it.name) && !/\b(cancel|back|deny|no|close)\b/i.test(it.name) && !/\d/.test(it.name))
+    if (named) return named.slot
+    const byLore = items.find(it => it.lore.some(l => /click to (buy|confirm|purchase)/i.test(l)) && !/\d/.test(it.name))
+    if (byLore) return byLore.slot
+    const plain = it => !/\d/.test(it.name) && !it.lore.some(l => /\d/.test(l))
+    const lime = items.find(it => /^lime_(stained_glass(_pane)?|wool|concrete|terracotta|dye)$/.test(it.id) && plain(it))
+    const green = items.find(it => /^(green_(stained_glass(_pane)?|wool|concrete|terracotta|dye)|emerald_block)$/.test(it.id) && plain(it))
+    return (lime || green || { slot: -1 }).slot
+  }
+
+  // Buys one batch of spawners. Returns how many were bought.
+  async buyOnce (mob, want) {
+    const bot = this.bot
+    await this.openShards()
+    const sp = spawnersIn(bot.currentWindow, bot).find(s => s.mob.toLowerCase() === mob.toLowerCase())
+    if (!sp) throw new Error(`The Shards page has no ${mob} spawner.`)
+    if (sp.price) this.lastPrice = sp.price
+    const beforeId = bot.currentWindow.id
+    // some menus animate, so "changed" means a new window or the spawners are gone
+    const moved = () => !bot.currentWindow || bot.currentWindow.id !== beforeId || !spawnersIn(bot.currentWindow, bot).length
+    const mark = this.afk.lineNo
+    await this.click(sp.slot)
+    const what = await waitFor(() => {
+      const refused = this.chatAfter(mark, REFUSED)
+      if (refused) return { refused }
+      if (this.chatAfter(mark, BOUGHT)) return { bought: true }
+      if (moved()) return { menu: true }
+      return null
+    }, 5000, this.token)
+    if (!what) throw new Error(`Clicking the ${mob} spawner did nothing.`)
+    if (what.refused) throw new Error(`The server said: ${what.refused.text}`)
+    if (what.bought) return 1
+    await sleep(400)
+    // a confirm menu (or the window closed / went back)
+    if (!bot.currentWindow) {
+      const msg = await waitFor(() => this.chatAfter(mark, REFUSED) || this.chatAfter(mark, BOUGHT), 2500, this.token)
+      if (msg && REFUSED.test(msg.text)) throw new Error(`The server said: ${msg.text}`)
+      return msg ? 1 : 0
+    }
+    this.report('after clicking the spawner')
+    const amount = await this.setAmount(want)
+    const slot = this.confirmSlot()
+    if (slot < 0) throw new Error('No Confirm button after clicking the spawner. The menus are in data/shop-report.json.')
+    const confirmId = bot.currentWindow.id
+    const mark2 = this.afk.lineNo
+    await this.click(slot)
+    const done = await waitFor(() => {
+      const refused = this.chatAfter(mark2, REFUSED)
+      if (refused) return { refused }
+      if (this.chatAfter(mark2, BOUGHT)) return { bought: true }
+      return null
+    }, 3000, this.token)
+    this.report('after Confirm', { amountShown: amount, chat: done ? (done.refused ? done.refused.text : 'bought') : null })
+    if (done && done.refused) throw new Error(`The server said: ${done.refused.text}`)
+    if (done) return amount
+    // no chat message: count it if the menu moved on
+    const w = bot.currentWindow
+    return !w || w.id !== confirmId || this.confirmSlot() < 0 ? amount : 0
+  }
+}
+
+function shardsNow (afk) {
+  const m = String(afk.stats.shards ?? '').replace(/,/g, '').match(/(\d+(?:\.\d+)?)\s*([kmb])?/i)
+  if (!m) return null
+  return parseFloat(m[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1)
+}
+
+// Runs on an AfkBot (Java). Keeps afk.job up to date for the dashboard.
+async function buySpawners (afk, mob, amount) {
+  if (!afk.mc || afk.status !== 'online') throw new Error('The bot has to be online.')
+  if (afk.macro) throw new Error('The bot is playing a macro. Stop it first.')
+  if (afk.job && afk.job.state === 'running') throw new Error('The bot is already buying.')
+  const known = prices().list.find(p => p.mob.toLowerCase() === mob.toLowerCase())
+  amount = Math.max(1, Math.min(1000, Math.floor(Number(amount) || 1)))
+  const token = {}
+  const job = { kind: 'shop', mob, amount, bought: 0, state: 'running', text: `Opening /shop`, token }
+  afk.job = job
+  afk.busy = true
+  afk.changed()
+  afk.write('info', `Buying ${amount} ${mob} spawner${amount === 1 ? '' : 's'}`)
+  const shop = new Shopper(afk, token)
+  let empty = 0
+  try {
+    while (job.bought < amount) {
+      if (token.cancelled) throw new Error('Stopped')
+      const price = shop.lastPrice || (known && known.price)
+      const have = shardsNow(afk)
+      if (price && have !== null && have * 1.01 < price) throw new Error(`Not enough shards for another ${mob} spawner (has about ${Math.round(have).toLocaleString('en-US')}, costs ${price.toLocaleString('en-US')}).`)
+      // don't ask for more than the bot can pay for in one go
+      const affordable = price && have !== null ? Math.max(1, Math.floor(have * 1.01 / price)) : MAX_ONE_BUY
+      const got = await shop.buyOnce(mob, Math.min(MAX_ONE_BUY, amount - job.bought, affordable))
+      if (got > 0) {
+        job.bought += got
+        empty = 0
+        job.text = `Bought ${job.bought} of ${amount}`
+        afk.changed()
+      } else if (++empty >= 3) {
+        throw new Error('Three tries in a row bought nothing. The menus are in data/shop-report.json.')
+      }
+      await sleep(human(600, 1600))
+    }
+    job.state = 'done'
+    job.text = `Bought ${job.bought} ${mob} spawner${job.bought === 1 ? '' : 's'}`
+    afk.write('info', job.text)
+  } catch (e) {
+    job.state = token.cancelled ? 'stopped' : 'failed'
+    job.text = token.cancelled ? `Stopped after buying ${job.bought}` : `${e.message}${job.bought ? ` (bought ${job.bought} first)` : ''}`
+    afk.write(token.cancelled ? 'info' : 'error', `Shop: ${job.text}`)
+  } finally {
+    try { const b = shop.bot; if (b.currentWindow) b.closeWindow(b.currentWindow) } catch {}
+    if (afk.job === job) afk.busy = false
+    // remember what it bought and spent
+    if (job.bought) {
+      const t = afk.cfg.tally || (afk.cfg.tally = { earned: 0, day: '', today: 0, spent: 0, bought: {}, disconnects: 0, lastShardAt: 0 })
+      t.bought = t.bought || {}
+      t.bought[mob] = (t.bought[mob] || 0) + job.bought
+      addDay('bought', job.bought)
+      t.spent = (t.spent || 0) + job.bought * (shop.lastPrice || (known && known.price) || 0)
+      // the dashboard's own shard count goes down by what was spent
+      if (afk.cfg.shards != null) {
+        afk.cfg.shards = Math.max(0, afk.cfg.shards - job.bought * (shop.lastPrice || (known && known.price) || 0))
+        afk.stats.shards = afk.cfg.shards
+      }
+      save()
+    }
+    delete job.token
+    job.at = Date.now()
+    afk.changed()
+
+  }
+}
+
+function stopJob (afk) {
+  if (afk.job && afk.job.state === 'running' && afk.job.token) afk.job.token.cancelled = true
+}
+
+// Opens the Shards page and reads every spawner and its price.
+async function readPrices (afk) {
+  if (!afk.mc || afk.status !== 'online') throw new Error('The bot has to be online.')
+  if (afk.busy) throw new Error('The bot is busy (a macro or a purchase). Try again when it finishes.')
+  afk.busy = true
+  const shop = new Shopper(afk, {})
+  try {
+    await shop.openShards()
+    const list = spawnersIn(shop.bot.currentWindow, shop.bot).filter(s => s.price).map(({ mob, price }) => ({ mob, price }))
+    if (!list.length) throw new Error('No prices on the Shards page.')
+    config.donut.prices = list
+    config.donut.pricesAt = Date.now()
+    save()
+    afk.write('info', `Read ${list.length} spawner prices from /shop`)
+    return prices()
+  } finally {
+    try { const b = shop.bot; if (b.currentWindow) b.closeWindow(b.currentWindow) } catch {}
+    afk.busy = false
+  }
+}
+
+module.exports = { SPAWNERS, prices, buySpawners, stopJob, readPrices, priceFrom, spawnersIn, textOf, menuItems }

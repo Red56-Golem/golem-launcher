@@ -1,0 +1,796 @@
+'use strict'
+// Golem AFK: runs Minecraft AFK bots and serves the dashboard.
+const http = require('http')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const { exec } = require('child_process')
+const express = require('express')
+const { WebSocketServer } = require('ws')
+const store = require('./store')
+const { config, save, saveNow, merge, botDefaults, history } = store
+const crypto = require('crypto')
+const { AfkBot, SUPPORTED, STEP_TYPES } = require('./bot')
+const { BedrockBot } = require('./bedrock')
+const shots = require('./shots')
+const updater = require('./updater')
+const signin = require('./signin')
+const proxyLib = require('./proxy')
+const alerts = require('./alerts')
+const donut = require('./donut')
+const { proxyKey, PER_PROXY } = store
+
+const VERSION = updater.CURRENT
+const BACKGROUND = process.argv.includes('--background')
+const PUBLIC = path.join(__dirname, '..', 'public')
+
+// ---------------------------------------------------------------------------
+// bots
+
+const bots = new Map()
+let lastLanes = ''
+function addBot (cfg) {
+  const bot = cfg.edition === 'bedrock' ? new BedrockBot(cfg) : new AfkBot(cfg)
+  bot.on('change', b => {
+    broadcast({ type: 'bot', bot: b.publicState() })
+    const l = JSON.stringify(lanes())
+    if (l !== lastLanes) { lastLanes = l; broadcast({ type: 'lanes', lanes: JSON.parse(l) }) }
+  })
+  bot.on('cmd', (b, line) => broadcast({ type: 'line', id: b.cfg.id, line }))
+  bots.set(cfg.id, bot)
+  return bot
+}
+for (const cfg of config.bots) addBot(cfg)
+
+// At most PER_PROXY bots run through one proxy, and at most PER_PROXY without one.
+// withQueued: also count bots waiting in the start-up queue.
+function laneBlock (bot, withQueued) {
+  const key = proxyKey(bot.cfg)
+  const used = [...bots.values()].filter(b => b !== bot && (b.isActive() || (withQueued && b.queued)) && proxyKey(b.cfg) === key).length
+  if (used < PER_PROXY) return ''
+  return key === 'none'
+    ? `Not started: ${PER_PROXY} bots without a proxy are already running. Put this one in a group with a proxy, or stop another bot.`
+    : `Not started: ${PER_PROXY} bots are already running through this proxy. Use a group with a different proxy, or stop another bot.`
+}
+AfkBot.gate = (bot) => laneBlock(bot, false)
+
+// how many bots use each proxy (and no proxy) right now, for the dashboard
+function lanes () {
+  const out = {}
+  for (const b of bots.values()) {
+    const key = proxyKey(b.cfg)
+    const lane = out[key] || (out[key] = { running: 0, groups: [] })
+    if (b.isActive()) lane.running++
+  }
+  for (const g of config.groups) {
+    const key = proxyKey({ group: g.id })
+    const lane = out[key] || (out[key] = { running: 0, groups: [] })
+    lane.groups.push(g.id)
+  }
+  return out
+}
+
+// The app may have been closed while bots were online: end their "online" stretch
+// at the last time the app was known to be running.
+;(function closeOpenHistory () {
+  const alive = history.__alive || Date.now()
+  for (const [id, list] of Object.entries(history)) {
+    if (id === '__alive' || !Array.isArray(list)) continue
+    const last = list[list.length - 1]
+    if (last && last.s === 'on') list.push({ t: Math.max(last.t, alive), s: 'off' })
+  }
+})()
+setInterval(() => store.touchAlive(), 60000).unref()
+
+function historyFor (id) {
+  return (history[id] || []).slice(-400)
+}
+
+// ---------------------------------------------------------------------------
+// web server
+
+const app = express()
+app.disable('x-powered-by')
+app.use(express.json({ limit: '64kb' }))
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  next()
+})
+
+function cookieToken (req) {
+  const m = /(?:^|;\s*)golem_afk=([a-f0-9]+)/.exec(req.headers.cookie || '')
+  return m ? m[1] : ''
+}
+function signedIn (req) { return store.hasSession(cookieToken(req)) }
+function setCookie (res, token) {
+  res.setHeader('Set-Cookie', `golem_afk=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${60 * 60 * 24 * 365}`)
+}
+
+const failures = new Map()
+function recentFailures (req) {
+  const ip = req.socket.remoteAddress || '?'
+  const list = (failures.get(ip) || []).filter(t => Date.now() - t < 60000)
+  failures.set(ip, list)
+  return list
+}
+
+app.get('/api/session', (req, res) => {
+  res.json({ needsPassword: !config.password, signedIn: signedIn(req), version: VERSION })
+})
+
+app.post('/api/setup', (req, res) => {
+  if (config.password) return res.status(409).json({ error: 'A password is already set.' })
+  const pw = String(req.body.password || '')
+  if (pw.length < 6) return res.status(400).json({ error: 'Use at least 6 characters.' })
+  store.setPassword(pw)
+  setCookie(res, store.newSession())
+  res.json({ ok: true })
+})
+
+app.post('/api/login', (req, res) => {
+  const failed = recentFailures(req)
+  if (failed.length >= 8) return res.status(429).json({ error: 'Too many wrong passwords. Wait a minute and try again.' })
+  if (!store.checkPassword(req.body.password)) {
+    failed.push(Date.now())
+    return res.status(401).json({ error: "That password isn't right." })
+  }
+  setCookie(res, store.newSession())
+  res.json({ ok: true })
+})
+
+app.post('/api/logout', (req, res) => {
+  store.endSession(cookieToken(req))
+  res.setHeader('Set-Cookie', 'golem_afk=; Path=/; Max-Age=0')
+  res.json({ ok: true })
+})
+
+// everything below needs a signed-in dashboard
+app.use('/api', (req, res, next) => {
+  if (!signedIn(req)) return res.status(401).json({ error: 'Sign in first.' })
+  next()
+})
+
+function cleanBot (input, base) {
+  const out = merge(base, {})
+  const b = input || {}
+  if (b.label !== undefined) out.label = String(b.label).slice(0, 40).trim()
+  if (b.host !== undefined) out.host = String(b.host).trim().replace(/^.*:\/\//, '').replace(/\/.*$/, '').slice(0, 120)
+  if (b.port !== undefined) out.port = clampInt(b.port, 1, 65535, 25565)
+  if (b.version !== undefined) out.version = b.version === 'auto' || SUPPORTED.includes(b.version) ? b.version : 'auto'
+  if (b.auth !== undefined) out.auth = b.auth === 'offline' ? 'offline' : 'microsoft'
+  if (b.name !== undefined) out.name = String(b.name).trim().slice(0, 16)
+  if (b.joinCommands !== undefined) out.joinCommands = String(b.joinCommands).slice(0, 4000)
+  if (b.autoEat !== undefined) out.autoEat = !!b.autoEat
+  if (b.alerts !== undefined) out.alerts = !!b.alerts
+  if (b.reconnect) {
+    if (b.reconnect.on !== undefined) out.reconnect.on = !!b.reconnect.on
+    if (b.reconnect.delay !== undefined) out.reconnect.delay = clampInt(b.reconnect.delay, 5, 300, 15)
+    if (b.reconnect.onDuplicate !== undefined) out.reconnect.onDuplicate = b.reconnect.onDuplicate === 'later' ? 'later' : 'wait'
+  }
+  if (b.antiAfk) {
+    if (b.antiAfk.on !== undefined) out.antiAfk.on = !!b.antiAfk.on
+    if (b.antiAfk.every !== undefined) out.antiAfk.every = clampInt(b.antiAfk.every, 5, 600, 30)
+    if (Array.isArray(b.antiAfk.actions)) out.antiAfk.actions = b.antiAfk.actions.filter(a => ['look', 'swing', 'jump', 'sneak', 'step'].includes(a))
+  }
+  if (b.group !== undefined) {
+    const g = config.groups.find(x => x.id === b.group)
+    if (g && g.id !== base.group) {
+      const members = config.bots.filter(c => c.group === g.id && c.id !== base.id).length
+      if (members >= PER_PROXY) throw new Error(`${g.name} already has ${PER_PROXY} bots, the most a group can have. Pick another group.`)
+    }
+    out.group = g ? g.id : ''
+  }
+  if (b.autoBuy !== undefined) out.autoBuy = !!b.autoBuy
+  if (b.proxy !== undefined) {
+    const v = String(b.proxy || '').trim().slice(0, 300)
+    if (v && v !== 'none') proxyLib.parseProxy(v) // throws with a readable message
+    out.proxy = v
+  }
+  if (Array.isArray(b.macros)) out.macros = b.macros.slice(0, 30).map(cleanMacro).filter(Boolean)
+  if (b.repeat) {
+    if (b.repeat.on !== undefined) out.repeat.on = !!b.repeat.on
+    if (b.repeat.every !== undefined) out.repeat.every = Math.min(1440, Math.max(0.5, Number(b.repeat.every) || 10))
+    if (b.repeat.commands !== undefined) out.repeat.commands = String(b.repeat.commands).slice(0, 4000)
+  }
+  return out
+}
+function cleanMacro (m) {
+  if (!m || typeof m !== 'object') return null
+  const num = (v) => (v === '' || v === null || v === undefined || !Number.isFinite(Number(v))) ? '' : Math.round(Number(v) * 10) / 10
+  return {
+    id: /^[a-f0-9]{6,16}$/.test(m.id) ? m.id : crypto.randomBytes(4).toString('hex'),
+    name: String(m.name || 'Macro').slice(0, 40).trim() || 'Macro',
+    loop: !!m.loop,
+    onJoin: !!m.onJoin,
+    steps: (Array.isArray(m.steps) ? m.steps : []).slice(0, 100).filter(st => st && STEP_TYPES.includes(st.type)).map(st => {
+      const o = { type: st.type }
+      if (st.type === 'move') { o.x = num(st.x); o.y = num(st.y); o.z = num(st.z) }
+      if (st.type === 'wait' || st.type === 'sneak') o.seconds = Math.min(3600, Math.max(0.1, Number(st.seconds) || 1))
+      if (st.type === 'chat') o.text = String(st.text || '').slice(0, 256)
+      if (st.type === 'look') o.dir = ['north', 'east', 'south', 'west', 'up', 'down'].includes(st.dir) ? st.dir : 'north'
+      if (st.type === 'slot') o.slot = clampInt(st.slot, 1, 9, 1)
+      if (st.type === 'click') o.name = String(st.name || '').slice(0, 60)
+      return o
+    })
+  }
+}
+function clampInt (v, lo, hi, d) {
+  const n = parseInt(v, 10)
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d
+}
+
+app.get('/api/bots', (req, res) => {
+  res.json({
+    groups: config.groups,
+    macros: config.macros,
+    donut: donut.prices(),
+    chart,
+    settings: { afkCommand: config.settings.afkCommand, autoAfk: config.settings.autoAfk, buyMob: config.settings.buyMob },
+    perProxy: PER_PROXY,
+    lanes: lanes(),
+    bots: [...bots.values()].map(b => b.publicState()),
+    versions: SUPPORTED.filter(v => /^\d+\.\d+(\.\d+)?$/.test(v)).slice().reverse()
+  })
+})
+
+// every bot's online/offline times, for the 24 hour bars in the bot list
+app.get('/api/history', (req, res) => {
+  const out = {}
+  for (const id of bots.keys()) out[id] = historyFor(id)
+  res.json(out)
+})
+
+app.get('/api/bots/:id/log', (req, res) => {
+  const bot = bots.get(req.params.id)
+  if (!bot) return res.status(404).json({ error: 'No such bot.' })
+  res.json({ log: bot.cmdLog, history: historyFor(bot.cfg.id) })
+})
+
+app.get('/api/bots/:id/shot.png', (req, res) => {
+  const bot = bots.get(req.params.id)
+  if (!bot) return res.status(404).end()
+  res.setHeader('Cache-Control', 'private, max-age=86400') // each picture has its own ?t= address
+  res.sendFile(shots.shotFile(bot.cfg.id), err => { if (err && !res.headersSent) res.status(404).end() })
+})
+
+app.post('/api/bots', (req, res) => {
+  if (bots.size >= 50) return res.status(400).json({ error: 'That is a lot of bots. 50 is the limit.' })
+  const base = botDefaults()
+  if (req.body.edition === 'bedrock') { base.edition = 'bedrock'; base.port = 19132 }
+  let cfg
+  try { cfg = cleanBot(req.body, base) } catch (e) { return res.status(400).json({ error: e.message }) }
+  if (!cfg.host) return res.status(400).json({ error: 'Enter a server address.' })
+  config.bots.push(cfg)
+  saveNow()
+  const bot = addBot(cfg)
+  if (req.body.start && req.body.queue) queueStart(bot, () => bot.start())
+  else if (req.body.start) bot.start()
+  broadcast({ type: 'bot', bot: bot.publicState() })
+  res.json({ bot: bot.publicState() })
+})
+
+app.patch('/api/bots/:id', (req, res) => {
+  const bot = bots.get(req.params.id)
+  if (!bot) return res.status(404).json({ error: 'No such bot.' })
+  const before = JSON.stringify([bot.cfg.host, bot.cfg.port, bot.cfg.version, bot.cfg.auth, bot.cfg.name])
+  const proxyBefore = proxyKey(bot.cfg)
+  let next
+  try { next = cleanBot(req.body, bot.cfg) } catch (e) { return res.status(400).json({ error: e.message }) }
+  if (next.auth !== bot.cfg.auth) next.account = ''
+  Object.assign(bot.cfg, next)
+  save()
+  const after = JSON.stringify([bot.cfg.host, bot.cfg.port, bot.cfg.version, bot.cfg.auth, bot.cfg.name])
+  // a new proxy needs a new connection
+  if ((req.body.proxy !== undefined || req.body.group !== undefined) && proxyBefore !== proxyKey(bot.cfg) && bot.isActive()) bot.restart()
+  bot.changed()
+  res.json({ bot: bot.publicState(), needsRestart: before !== after && bot.status !== 'stopped' })
+})
+
+app.delete('/api/bots/:id', (req, res) => {
+  const bot = bots.get(req.params.id)
+  if (!bot) return res.status(404).json({ error: 'No such bot.' })
+  bot.stop('Removed')
+  bot.removeAllListeners('change')
+  bot.removeAllListeners('line')
+  bots.delete(bot.cfg.id)
+  config.bots = config.bots.filter(b => b.id !== bot.cfg.id)
+  saveNow()
+  setTimeout(() => {
+    fs.rmSync(path.join(store.DATA, 'auth', bot.cfg.id), { recursive: true, force: true })
+    shots.remove(bot.cfg.id)
+  }, 4000)
+  broadcast({ type: 'removed', id: bot.cfg.id })
+  res.json({ ok: true })
+})
+
+app.post('/api/bots/:id/:action', (req, res) => {
+  const bot = bots.get(req.params.id)
+  if (!bot) return res.status(404).json({ error: 'No such bot.' })
+  switch (req.params.action) {
+    case 'start':
+      if (bot.start() === false) return res.status(409).json({ error: bot.detail })
+      break
+    case 'stop': bot.stop(); break
+    case 'restart': bot.restart(); break
+    case 'say':
+      if (!bot.say(String(req.body.text || '').trim())) return res.status(409).json({ error: 'The bot has to be online to chat.' })
+      break
+    case 'choose-account': {
+      if (bot.cfg.auth !== 'microsoft') return res.status(409).json({ error: 'This bot uses an offline name.' })
+      if (!signin.findBrowser()) return res.status(409).json({ error: 'No Edge or Chrome found for the sign-in window. Use the code instead.' })
+      res.json({ ok: true })
+      bot.write('info', 'Sign-in window opened. Choose the Microsoft account for this bot.')
+      broadcast({ type: 'signin', id: bot.cfg.id, state: 'open' })
+      signin.pickAccount().then(token => {
+        signin.saveForBot(bot.cfg.id, token)
+        bot.cfg.account = ''
+        save()
+        bot.write('info', 'Signed in. Joining with the new account.')
+        broadcast({ type: 'signin', id: bot.cfg.id, state: 'done' })
+        if (bot.status === 'stopped' || bot.status === 'error' || bot.status === 'paused') bot.start()
+        else bot.restart()
+      }).catch(e => {
+        bot.write('error', e.message)
+        broadcast({ type: 'signin', id: bot.cfg.id, state: 'failed', text: e.message })
+      })
+      return
+    }
+    case 'screenshot':
+      return bot.screenshot().then(shot => res.json({ shot })).catch(e => res.status(409).json({ error: e.message }))
+    case 'play':
+      try { bot.playMacro(String(req.body.macro || '')) } catch (e) { return res.status(409).json({ error: e.message }) }
+      break
+    case 'stopmacro': bot.stopMacro(); break
+    case 'stopjob': donut.stopJob(bot); break
+    case 'afk':
+      if (bot.status !== 'online') return res.status(409).json({ error: 'The bot has to be online.' })
+      bot.lastAfkCmd = Date.now()
+      bot.sendLine(config.settings.afkCommand || '/afk 1')
+      break
+    case 'buy': {
+      const r = buyMax(bot)
+      if (r.error) return res.status(409).json({ error: r.error })
+      return res.json({ ok: true, amount: r.amount })
+    }
+    case 'forget':
+      bot.stop('Signed out')
+      setTimeout(() => bot.forgetAccount(), 3500)
+      break
+    default: return res.status(404).json({ error: 'Unknown action.' })
+  }
+  res.json({ ok: true })
+})
+
+// Bots start one at a time, startDelay seconds apart (Settings), so a server
+// doesn't see many joins at once.
+const startQueue = []
+let starting = false
+function queueStart (bot, fn) {
+  if (startQueue.some(q => q.bot === bot)) return
+  const blocked = laneBlock(bot, true)
+  if (blocked) {
+    bot.cfg.running = false
+    save()
+    bot.setStatus('stopped', blocked)
+    return
+  }
+  bot.queued = true
+  startQueue.push({ bot, fn })
+  if (starting || startQueue.length > 1) bot.setStatus('connecting', 'Waiting for its turn to start')
+  if (!starting) runQueue()
+}
+async function runQueue () {
+  starting = true
+  while (startQueue.length) {
+    const { bot, fn } = startQueue.shift()
+    if (!bots.has(bot.cfg.id) || !bot.queued) continue
+    bot.queued = false
+    try { fn() } catch (e) { console.error(e) }
+    // wait even if nothing else is queued yet: more bots may be added right after this one
+    await new Promise(r => setTimeout(r, Math.min(60, Math.max(1, Number(config.settings.startDelay) || 3)) * 1000))
+  }
+  starting = false
+}
+
+app.post('/api/all/:action', (req, res) => {
+  for (const bot of bots.values()) {
+    if (req.params.action === 'start' && bot.status === 'stopped') queueStart(bot, () => bot.start())
+    if (req.params.action === 'stop' && bot.status !== 'stopped') { startQueue.splice(0, startQueue.length); bot.stop() }
+  }
+  res.json({ ok: true })
+})
+
+// ---- updates
+updater.events.on('change', st => broadcast({ type: 'update', update: st }))
+app.get('/api/update', (req, res) => res.json(updater.state))
+app.post('/api/update/check', async (req, res) => res.json(await updater.check()))
+app.post('/api/update/install', async (req, res) => {
+  try {
+    const r = await updater.applyOnline()
+    res.json(r)
+    setTimeout(() => shutdown('Updating', 3), 500)
+  } catch (e) { updater.fail(e); res.status(409).json({ error: e.message }) }
+})
+app.post('/api/update/upload', express.raw({ type: () => true, limit: '400mb' }), async (req, res) => {
+  try {
+    if (!req.body || !req.body.length) throw new Error('No file arrived.')
+    const r = await updater.applyZip(req.body)
+    res.json(r)
+    setTimeout(() => shutdown('Updating', 3), 500)
+  } catch (e) { updater.fail(e); res.status(409).json({ error: e.message }) }
+})
+
+// ---- groups (each can have a proxy)
+app.get('/api/groups', (req, res) => res.json({ groups: config.groups }))
+
+app.put('/api/groups', (req, res) => {
+  const list = Array.isArray(req.body.groups) ? req.body.groups.slice(0, 100) : null
+  if (!list) return res.status(400).json({ error: 'No groups sent.' })
+  const next = []
+  for (const g of list) {
+    const name = String(g.name || '').trim().slice(0, 40)
+    if (!name) return res.status(400).json({ error: 'Every group needs a name.' })
+    const proxy = String(g.proxy || '').trim().slice(0, 300)
+    try { proxyLib.parseProxy(proxy) } catch (e) { return res.status(400).json({ error: `${name}: ${e.message}` }) }
+    next.push({ id: /^[a-f0-9]{6,16}$/.test(g.id) ? g.id : crypto.randomBytes(4).toString('hex'), name, proxy })
+  }
+  const before = new Map(config.groups.map(g => [g.id, g.proxy]))
+  config.groups = next
+  // bots in deleted groups leave them; bots whose proxy changed reconnect
+  const restarted = []
+  for (const bot of bots.values()) {
+    const g = next.find(x => x.id === bot.cfg.group)
+    if (bot.cfg.group && !g) bot.cfg.group = ''
+    const was = before.get(bot.cfg.group) || ''
+    const now = g ? g.proxy : ''
+    if (was !== now && bot.status !== 'stopped' && bot.status !== 'error' && bot.status !== 'paused') { bot.restart(); restarted.push(bot.displayName()) }
+    bot.changed()
+  }
+  saveNow()
+  broadcast({ type: 'groups', groups: config.groups, lanes: lanes() })
+  res.json({ groups: config.groups, restarted })
+})
+
+app.post('/api/groups/test', async (req, res) => {
+  let p
+  try { p = proxyLib.parseProxy(req.body.proxy) } catch (e) { return res.json({ ok: false, error: e.message }) }
+  if (!p) return res.json({ ok: false, error: 'Enter a proxy first.' })
+  const host = String(req.body.host || 'og-donutsmp.net')
+  try {
+    const r = await proxyLib.testProxy(p, host, 25565)
+    res.json({ ok: true, ms: r.ms, udp: r.udp, type: p.type })
+  } catch (e) { res.json({ ok: false, error: e.message }) }
+})
+
+app.post('/api/groups/:id/:action', (req, res) => {
+  const list = [...bots.values()].filter(b => b.cfg.group === req.params.id)
+  for (const bot of list) {
+    if (req.params.action === 'start' && bot.status === 'stopped') queueStart(bot, () => bot.start())
+    if (req.params.action === 'stop') {
+      const i = startQueue.findIndex(q => q.bot === bot)
+      if (i >= 0) startQueue.splice(i, 1)
+      if (bot.status !== 'stopped') bot.stop()
+    }
+  }
+  res.json({ ok: true, count: list.length })
+})
+
+// ---- macros for every bot (Macros tab)
+const SHOT_SECONDS = [0, 1, 10, 25, 30, 45, 60, 120, 300, 600, 1500, 1800, 2700]
+
+app.put('/api/macros', (req, res) => {
+  if (!Array.isArray(req.body.macros)) return res.status(400).json({ error: 'No macros sent.' })
+  config.macros = req.body.macros.slice(0, 50).map(cleanMacro).filter(Boolean)
+  saveNow()
+  broadcast({ type: 'macros', macros: config.macros })
+  res.json({ macros: config.macros })
+})
+
+// targets: { group: '' | groupId | '__none', bots: [ids] } -> online bots that match
+function targetBots (body) {
+  let list = [...bots.values()].filter(b => b.status === 'online')
+  if (Array.isArray(body.bots) && body.bots.length) list = list.filter(b => body.bots.includes(b.cfg.id))
+  else if (body.group === '__none') list = list.filter(b => !b.cfg.group)
+  else if (body.group) list = list.filter(b => b.cfg.group === body.group)
+  return list
+}
+
+app.post('/api/macros/:id/play', (req, res) => {
+  const m = config.macros.find(x => x.id === req.params.id)
+  if (!m) return res.status(404).json({ error: 'That macro is gone.' })
+  const started = []
+  const skipped = []
+  for (const bot of targetBots(req.body || {})) {
+    try { bot.playMacro(m.id); started.push(bot.displayName()) } catch (e) { skipped.push({ name: bot.displayName(), why: e.message }) }
+  }
+  if (!started.length && !skipped.length) return res.status(409).json({ error: 'No bots are online to play it.' })
+  res.json({ started, skipped })
+})
+
+app.post('/api/macros/stop', (req, res) => {
+  let n = 0
+  for (const bot of bots.values()) {
+    if (bot.macro && bot.macro.global && (!req.body.id || bot.macro.id === req.body.id)) { bot.stopMacro(); n++ }
+  }
+  res.json({ stopped: n })
+})
+
+// ---- OG Donut: spawners from /shop -> Shards
+app.get('/api/donut', (req, res) => res.json(donut.prices()))
+
+app.post('/api/donut/prices', async (req, res) => {
+  const bot = bots.get(String(req.body.bot || '')) || [...bots.values()].sort((a, b) => (a.edition() === 'java' ? 0 : 1) - (b.edition() === 'java' ? 0 : 1)).find(b => b.status === 'online' && !b.busy)
+  if (!bot) return res.status(409).json({ error: 'Start a bot first. It opens /shop to read the prices.' })
+  try {
+    const p = await donut.readPrices(bot)
+    broadcast({ type: 'donut', donut: p })
+    res.json(p)
+  } catch (e) { res.status(409).json({ error: `${bot.displayName()}: ${e.message}` }) }
+})
+
+app.post('/api/donut/buy', (req, res) => {
+  const mob = String(req.body.mob || '')
+  const known = donut.prices().list.find(p => p.mob === mob)
+  if (!known) return res.status(400).json({ error: 'Pick a spawner.' })
+  const amount = clampInt(req.body.amount, 1, 1000, 1)
+  const ids = Array.isArray(req.body.bots) ? req.body.bots : []
+  if (!ids.length) return res.status(400).json({ error: 'Pick at least one bot.' })
+  const started = []
+  const skipped = []
+  for (const id of ids) {
+    const bot = bots.get(id)
+    if (!bot) continue
+    let why = ''
+    if (bot.status !== 'online') why = 'not online'
+    else if (bot.macro) why = 'playing a macro'
+    else if (bot.job && bot.job.state === 'running') why = 'already buying'
+    if (why) { skipped.push({ name: bot.displayName(), why }); continue }
+    donut.buySpawners(bot, mob, amount).catch(e => bot.write('error', `Shop: ${e.message}`))
+    started.push(bot.displayName())
+  }
+  if (!started.length) return res.status(409).json({ error: skipped.length ? skipped.map(s => `${s.name}: ${s.why}`).join('. ') : 'None of those bots exist.' })
+  res.json({ started, skipped })
+})
+
+app.post('/api/donut/stop', (req, res) => {
+  for (const bot of bots.values()) donut.stopJob(bot)
+  res.json({ ok: true })
+})
+
+// ---- AFK area, auto-buy and the shards chart
+
+// Buys as many of the chosen spawner (Settings) as the bot can afford
+function buyMax (bot) {
+  const mob = config.settings.buyMob
+  const p = donut.prices().list.find(x => x.mob === mob)
+  if (!p) return { error: 'Pick what to buy in Settings first.' }
+  if (bot.status !== 'online') return { error: 'The bot has to be online.' }
+  if (bot.macro) return { error: 'The bot is playing a macro.' }
+  if (bot.job && bot.job.state === 'running') return { error: 'The bot is already buying.' }
+  const have = shardsOf(bot)
+  if (have === null) return { error: "The bot's shards aren't known yet. Wait a minute." }
+  const amount = Math.floor(have / p.price)
+  if (amount < 1) return { error: `Not enough shards for a ${mob} spawner (${p.price.toLocaleString('en-US')}).` }
+  donut.buySpawners(bot, mob, amount).catch(e => bot.write('error', `Shop: ${e.message}`))
+  return { amount }
+}
+function shardsOf (bot) {
+  const m = String(bot.stats.shards ?? '').replace(/,/g, '').match(/(\d+(?:\.\d+)?)\s*([kmb])?/i)
+  return m ? parseFloat(m[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1) : null
+}
+
+setInterval(() => {
+  const now = Date.now()
+  for (const bot of bots.values()) {
+    if (bot.status !== 'online' || bot.busy || !bot.onlineSince) continue
+    // not in the AFK area: send the AFK command again (at most every 2 minutes)
+    if (config.settings.autoAfk && config.settings.afkCommand && now - bot.onlineSince > 20000 && !bot.inAfk() && now - (bot.lastAfkCmd || 0) > 120000) {
+      bot.lastAfkCmd = now
+      bot.write('info', `Not in the AFK area, sending ${config.settings.afkCommand}`)
+      bot.sendLine(config.settings.afkCommand, true)
+      continue
+    }
+    if (bot.cfg.autoBuy && now - (bot.lastAutoBuy || 0) > 60000) {
+      const p = donut.prices().list.find(x => x.mob === config.settings.buyMob)
+      const have = shardsOf(bot)
+      if (p && have !== null && have >= p.price) { bot.lastAutoBuy = now; buyMax(bot) }
+    }
+  }
+}, 10000).unref()
+
+// total shards of all bots, one point a minute for the last 4 hours (memory only)
+const chart = []
+function sampleChart () {
+  let total = 0
+  let any = false
+  for (const bot of bots.values()) {
+    if (bot.status !== 'online') continue
+    const v = shardsOf(bot)
+    if (v !== null) { total += v; any = true }
+  }
+  if (!any) return
+  const point = { t: Date.now(), v: Math.round(total) }
+  chart.push(point)
+  while (chart.length > 240) chart.shift()
+  broadcast({ type: 'chart', point })
+}
+setInterval(sampleChart, 60000).unref()
+setTimeout(sampleChart, 45000).unref()
+
+app.get('/api/settings', (req, res) => {
+  res.json({ settings: config.settings, lan: lanAddresses(), windows: process.platform === 'win32', data: store.DATA })
+})
+
+app.patch('/api/settings', (req, res) => {
+  const b = req.body || {}
+  const s = config.settings
+  if (b.webhookUrl !== undefined) {
+    const url = String(b.webhookUrl).trim()
+    if (url && !alerts.validUrl(url)) return res.status(400).json({ error: "That doesn't look like a Discord webhook link." })
+    s.webhookUrl = url
+  }
+  if (b.alerts) for (const k of Object.keys(s.alerts)) if (b.alerts[k] !== undefined) s.alerts[k] = !!b.alerts[k]
+  if (b.lowHealth !== undefined) s.lowHealth = clampInt(b.lowHealth, 1, 19, 6)
+  if (b.keywords !== undefined) s.keywords = String(b.keywords).slice(0, 300)
+  if (b.startDelay !== undefined) s.startDelay = clampInt(b.startDelay, 1, 60, 3)
+  if (b.afkCommand !== undefined) s.afkCommand = String(b.afkCommand).trim().slice(0, 100)
+  if (b.autoAfk !== undefined) s.autoAfk = !!b.autoAfk
+  if (b.buyMob !== undefined && donut.prices().list.some(p => p.mob === b.buyMob)) s.buyMob = String(b.buyMob)
+  if (b.screenshotSeconds !== undefined) s.screenshotSeconds = SHOT_SECONDS.includes(Number(b.screenshotSeconds)) ? Number(b.screenshotSeconds) : 60
+  if (b.allowPhone !== undefined) s.allowPhone = !!b.allowPhone
+  if (b.port !== undefined) s.port = clampInt(b.port, 1024, 65535, 8080)
+  if (b.startWithWindows !== undefined) {
+    const err = setStartup(!!b.startWithWindows)
+    if (err) return res.status(400).json({ error: err })
+    s.startWithWindows = !!b.startWithWindows
+  }
+  if (b.password !== undefined) {
+    if (String(b.password).length < 6) return res.status(400).json({ error: 'Use at least 6 characters.' })
+    store.setPassword(String(b.password))
+    setCookie(res, store.newSession())
+  }
+  saveNow()
+  broadcast({ type: 'settings', settings: { afkCommand: s.afkCommand, autoAfk: s.autoAfk, buyMob: s.buyMob } })
+  res.json({ settings: s })
+})
+
+app.post('/api/settings/test-alert', async (req, res) => {
+  res.json(await alerts.test(String(req.body.url || config.settings.webhookUrl || '')))
+})
+
+app.post('/api/quit', (req, res) => {
+  res.json({ ok: true })
+  setTimeout(() => shutdown('Quit from the dashboard'), 300)
+})
+
+app.use(express.static(PUBLIC, { index: 'index.html', maxAge: 0 }))
+app.use((req, res) => res.sendFile(path.join(PUBLIC, 'index.html')))
+
+// ---------------------------------------------------------------------------
+// live updates
+
+const server = http.createServer(app)
+const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 })
+server.on('upgrade', (req, socket, head) => {
+  if (req.url !== '/live' || !signedIn(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+    return socket.destroy()
+  }
+  wss.handleUpgrade(req, socket, head, ws => {
+    ws.isAlive = true
+    ws.on('pong', () => { ws.isAlive = true })
+    ws.send(JSON.stringify({ type: 'hello', bots: [...bots.values()].map(b => b.publicState()) }))
+  })
+})
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) { ws.terminate(); continue }
+    ws.isAlive = false
+    ws.ping()
+  }
+}, 30000).unref()
+
+function broadcast (msg) {
+  const data = JSON.stringify(msg)
+  for (const ws of wss.clients) if (ws.readyState === 1) ws.send(data)
+}
+
+// ---------------------------------------------------------------------------
+// Windows startup
+
+function startupFile () {
+  return path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Golem AFK.vbs')
+}
+function setStartup (on) {
+  if (process.platform !== 'win32') return 'Starting with Windows only works on Windows.'
+  try {
+    if (on) {
+      // run the start file hidden, so it restarts the app if it ever crashes
+      const bat = path.join(__dirname, '..', '..', 'Start Golem AFK.bat')
+      const target = fs.existsSync(bat)
+        ? `"""${bat}"" --background"`
+        : `"""${process.execPath}"" ""${path.join(__dirname, 'server.js')}"" --background"`
+      const vbs = 'Set sh = CreateObject("WScript.Shell")\r\n' +
+        `sh.CurrentDirectory = "${path.dirname(fs.existsSync(bat) ? bat : process.execPath)}"\r\n` +
+        `sh.Run ${target}, 0, False\r\n`
+      fs.writeFileSync(startupFile(), vbs)
+    } else {
+      fs.rmSync(startupFile(), { force: true })
+    }
+  } catch (e) {
+    return "Couldn't change the Windows startup setting: " + e.message
+  }
+  return ''
+}
+
+// ---------------------------------------------------------------------------
+// start up
+
+function lanAddresses () {
+  const out = []
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list || []) if (a.family === 'IPv4' && !a.internal) out.push(a.address)
+  }
+  return out
+}
+
+function openBrowser (url) {
+  if (BACKGROUND) return
+  const cmd = process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`
+  exec(cmd, () => {})
+}
+
+const port = Number(process.env.GOLEM_AFK_PORT) || config.settings.port
+const bindHost = config.settings.allowPhone ? '0.0.0.0' : '127.0.0.1'
+
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.log(`Golem AFK already seems to be running on port ${port}. Opening it.`)
+    openBrowser(`http://localhost:${port}`)
+    setTimeout(() => process.exit(0), 1500)
+  } else {
+    console.error(e)
+    process.exit(1)
+  }
+})
+
+updater.cleanup()
+setTimeout(() => updater.check().catch(() => {}), 20000).unref()
+setInterval(() => updater.check().catch(() => {}), 6 * 3600e3).unref()
+
+server.listen(port, bindHost, () => {
+  const local = `http://localhost:${port}`
+  console.log('')
+  console.log(`  Golem AFK ${VERSION} is running.`)
+  console.log(`  Dashboard:  ${local}`)
+  if (config.settings.allowPhone) for (const ip of lanAddresses()) console.log(`  On your phone (same Wi-Fi):  http://${ip}:${port}`)
+  console.log('')
+  console.log('  Keep this window open. Closing it stops every bot.')
+  console.log('')
+  openBrowser(local)
+  for (const bot of bots.values()) {
+    if (bot.cfg.running) queueStart(bot, () => bot.start())
+  }
+})
+
+let shuttingDown = false
+function shutdown (why, code = 0) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`\n  Stopping bots (${why})...`)
+  for (const bot of bots.values()) {
+    const keep = bot.cfg.running
+    if (bot.mc) { try { bot.mc.quit() } catch {} }
+    bot.cfg.running = keep // restart them next time the app opens
+    store.addHistory(bot.cfg.id, 'off')
+  }
+  history.__alive = Date.now()
+  try { saveNow() } catch {}
+  try { fs.writeFileSync(path.join(store.DATA, 'history.json'), JSON.stringify(history)) } catch {}
+  setTimeout(() => process.exit(code), 800)
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(sig, () => shutdown(sig))
+process.on('uncaughtException', (e) => { console.error('Unexpected error:', e) })
+process.on('unhandledRejection', (e) => { console.error('Unexpected error:', e) })

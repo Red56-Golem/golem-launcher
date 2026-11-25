@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#120F24">
+<title>Golem AFK</title>
+<link rel="icon" href="/golem.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><path d="M7 1h2l.4 2 1.3.6 1.7-1.2 1.4 1.4-1.2 1.7.6 1.3 2 .4v2l-2 .4-.6 1.3 1.2 1.7-1.4 1.4-1.7-1.2-1.3.6L9 15H7l-.4-2-1.3-.6-1.7 1.2-1.4-1.4 1.2-1.7L2.8 9.4 1 9V7l2-.4.6-1.3-1.2-1.7 1.4-1.4 1.7 1.2 1.3-.6zm1 4.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/></symbol>
+  <symbol id="i-down" viewBox="0 0 16 16"><path d="M8 13L2 7l1.4-1.4L8 10.2l4.6-4.6L14 7z"/></symbol>
+  <symbol id="i-close" viewBox="0 0 16 16"><path d="M3.4 2L8 6.6 12.6 2 14 3.4 9.4 8l4.6 4.6-1.4 1.4L8 9.4 3.4 14 2 12.6 6.6 8 2 3.4z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><path d="M7 1a6 6 0 0 1 4.8 9.6l3.3 3.3-1.4 1.4-3.3-3.3A6 6 0 1 1 7 1zm0 2a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></symbol>
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M1 2l14 6-14 6 2-6zm2.6 5h5.4v2H3.6L3 11.6 11 8 3 4.4z"/></symbol>
+</svg>
+
+<!-- sign in / first password -->
+<main id="gate" class="gate" hidden>
+  <form class="gate-card" id="gateForm">
+    <img src="/golem.svg" alt="" class="gate-mark" width="48" height="54">
+    <h1>Golem AFK</h1>
+    <p id="gateText">Sign in to your bots.</p>
+    <label class="field">
+      <span id="gateLabel">Password</span>
+      <input type="password" id="gatePass" autocomplete="current-password" required minlength="6">
+    </label>
+    <p class="form-error" id="gateError" role="alert"></p>
+    <button class="btn primary wide" id="gateBtn">Sign in</button>
+  </form>
+</main>
+
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <a class="brand" href="#" id="brand"><img src="/golem.svg" alt="" width="22" height="25"><span>Golem AFK</span></a>
+    <span class="grow"></span>
+    <button class="btn primary small" id="updatePill" hidden><svg><use href="#i-down"/></svg><span>Update ready</span></button>
+    <button class="btn ghost small" id="settingsBtn"><svg><use href="#i-gear"/></svg><span>Settings</span></button>
+  </header>
+
+  <main class="wrap">
+    <section class="hero" aria-live="polite">
+      <h1 id="heroTitle">Loading</h1>
+      <p id="heroText"></p>
+      <div class="lights" id="lights" aria-hidden="true"></div>
+      <ul class="legend">
+        <li><i class="bulb farming"></i>Farming</li>
+        <li><i class="bulb roaming"></i>Online, not in the AFK area</li>
+        <li><i class="bulb signin"></i>Waiting for sign-in</li>
+        <li><i class="bulb offline"></i>Offline</li>
+      </ul>
+    </section>
+
+    <section class="stats" id="stats"></section>
+
+    <div class="cols">
+      <section class="card accounts">
+        <div class="card-head">
+          <h2>Accounts</h2>
+          <label class="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input id="search" placeholder="Search names or emails" aria-label="Search accounts" autocomplete="off"></label>
+          <div class="chips" id="filters" role="group" aria-label="Show">
+            <button class="chip" data-filter="all" aria-pressed="true">All</button>
+            <button class="chip" data-filter="farming" aria-pressed="false">Farming</button>
+            <button class="chip" data-filter="online" aria-pressed="false">Online</button>
+            <button class="chip" data-filter="offline" aria-pressed="false">Offline</button>
+            <button class="chip" data-filter="bedrock" aria-pressed="false">Bedrock</button>
+          </div>
+          <select id="sort" aria-label="Sort">
+            <option value="offline">Offline first</option>
+            <option value="shards">Most shards</option>
+            <option value="today">Most earned today</option>
+            <option value="name">Name</option>
+          </select>
+        </div>
+        <div class="bulk" id="bulk" hidden>
+          <strong id="bulkCount"></strong>
+          <button class="btn small" data-bulk="start">Start</button>
+          <button class="btn small" data-bulk="stop">Stop</button>
+          <button class="btn small" data-bulk="afk">Re-AFK</button>
+          <button class="btn small" data-bulk="buy">Buy now</button>
+          <button class="btn small" data-bulk="autobuy-on">Auto-buy on</button>
+          <button class="btn small" data-bulk="autobuy-off">Auto-buy off</button>
+          <button class="btn small subtle" data-bulk="clear">Clear</button>
+        </div>
+        <div class="table">
+          <div class="thead">
+            <label class="check"><input type="checkbox" id="checkAll" aria-label="Select all shown"></label>
+            <span>Account</span><span class="num">Shards</span><span class="num">Earned today</span><span>Next spawner</span><span class="c-proxy">Proxy</span><span class="c-online">Online for</span><span></span>
+          </div>
+          <div id="rows"></div>
+          <p class="empty" id="empty" hidden></p>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="card">
+          <h2>Nice list</h2>
+          <p class="sub">Top earners today</p>
+          <ol class="nice" id="nice"></ol>
+        </section>
+        <section class="card">
+          <h2>Naughty list</h2>
+          <p class="sub">Accounts that are offline or not earning</p>
+          <ul class="naughty" id="naughty"></ul>
+        </section>
+        <section class="card">
+          <h2>Add accounts</h2>
+          <form id="addForm">
+            <label class="field"><span class="sub">Emails or nicknames, one per line</span>
+              <textarea name="names" rows="3" placeholder="alt1@outlook.com&#10;alt2@outlook.com" spellcheck="false" required></textarea>
+            </label>
+            <div class="segmented" role="radiogroup" aria-label="Edition">
+              <label><input type="radio" name="edition" value="java" checked><span>Java</span></label>
+              <label><input type="radio" name="edition" value="bedrock"><span>Bedrock</span></label>
+            </div>
+            <p class="sub tight">Each one signs in with its Microsoft account the first time, then joins <span id="addHost">og-donutsmp.net</span>.</p>
+            <p class="form-error" id="addError" role="alert"></p>
+            <button class="btn primary wide">Add and start</button>
+          </form>
+        </section>
+      </aside>
+    </div>
+  </main>
+</div>
+
+<!-- Microsoft sign-in for one account -->
+<dialog id="signinDialog" class="sheet">
+  <div class="sheet-body">
+    <header><h2 id="signinTitle">Sign in</h2><button type="button" class="btn icon ghost" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></header>
+    <p id="signinPC">Press <strong>Choose account</strong>. Microsoft's sign-in window opens on the PC with your saved accounts; pick the one this bot should use. It closes by itself and the bot joins.</p>
+    <p id="signinRemote" hidden>Press <strong>Choose account</strong> and finish on the PC running Golem AFK, where the window opens.</p>
+    <button class="btn primary wide" id="signinOpen">Choose account</button>
+    <p class="sub" id="signinState" role="status"></p>
+    <details class="code-way">
+      <summary>Use a code instead</summary>
+      <p>Open <a id="signinLink" target="_blank" rel="noopener">microsoft.com/link</a> on any device and enter <strong id="signinCode"></strong>. <button type="button" class="btn small" id="copyCode">Copy code</button></p>
+    </details>
+  </div>
+</dialog>
+
+<!-- one bot's settings -->
+<dialog id="botDialog" class="sheet wide-sheet">
+  <form id="botForm" class="sheet-body"></form>
+</dialog>
+
+<!-- groups and proxies -->
+<dialog id="groupDialog" class="sheet wide-sheet">
+  <form id="groupForm" class="sheet-body">
+    <header><h2>Groups and proxies</h2><button type="button" class="btn icon ghost" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></header>
+    <p class="sub">A group's bots start and stop together and connect through the group's proxy. A group holds up to 4 bots, and at most 4 bots run through one proxy, or without one. An account can also have its own proxy (open it in the list).</p>
+    <p class="lane-note" id="laneNote"></p>
+    <p class="sub">Proxy formats: <code>host:port</code>, <code>host:port:user:pass</code>, <code>socks5://user:pass@host:port</code> or <code>http://host:port</code>. Bedrock bots need SOCKS5 with UDP.</p>
+    <div id="groupRows"></div>
+    <button type="button" class="btn small" id="addGroup"><svg><use href="#i-plus"/></svg><span>Add group</span></button>
+    <p class="form-error" id="groupError" role="alert"></p>
+    <footer><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">Save groups</button></footer>
+  </form>
+</dialog>
+
+<!-- app settings -->
+<dialog id="setDialog" class="sheet wide-sheet">
+  <form id="setForm" class="sheet-body">
+    <header><h2>Settings</h2><button type="button" class="btn icon ghost" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></header>
+
+    <section class="group">
+      <h3>Farming</h3>
+      <div class="two">
+        <label class="field"><span>AFK command</span><input name="afkCommand" placeholder="/afk 1" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>Seconds between bots starting</span><input name="startDelay" type="number" min="1" max="60" step="1"></label>
+      </div>
+      <label class="switch"><input type="checkbox" name="autoAfk"><span>Send the AFK command again when a bot isn't in the AFK area. A bot counts as in the AFK area while its action bar counts down to the next shard, or its shards keep going up.</span></label>
+    </section>
+
+    <section class="group">
+      <h3>Buying</h3>
+      <label class="field"><span>What Buy now and auto-buy get</span><select name="buyMob" id="buyMob"></select></label>
+      <div class="inline"><button type="button" class="btn small" id="readPrices">Read prices from the shop</button><span class="sub" id="pricesAt"></span></div>
+    </section>
+
+    <section class="group">
+      <h3>Groups and proxies</h3>
+      <p class="sub" id="groupSummary"></p>
+      <button type="button" class="btn small" id="groupsBtn">Edit groups and proxies</button>
+    </section>
+
+    <section class="group">
+      <h3>Discord alerts</h3>
+      <p class="sub">Paste a webhook link from a Discord channel (Channel settings, Integrations, Webhooks) to get a message when a bot needs you.</p>
+      <div class="inline">
+        <input name="webhookUrl" placeholder="https://discord.com/api/webhooks/..." autocomplete="off" spellcheck="false" aria-label="Discord webhook link">
+        <button type="button" class="btn" id="testAlert">Send a test</button>
+      </div>
+      <p class="sub" id="testResult" role="status"></p>
+      <div class="checks">
+        <label><input type="checkbox" name="a_kicked"> Kicked or paused</label>
+        <label><input type="checkbox" name="a_stopped"> Stopped for good</label>
+        <label><input type="checkbox" name="a_died"> Died</label>
+        <label><input type="checkbox" name="a_lowHealth"> Low health</label>
+        <label><input type="checkbox" name="a_mentioned"> Name or keyword in chat</label>
+        <label><input type="checkbox" name="a_signIn"> Needs a Microsoft sign-in</label>
+        <label><input type="checkbox" name="a_backOnline"> Back online</label>
+      </div>
+      <div class="two">
+        <label class="field"><span>Low health means</span>
+          <select name="lowHealth"><option value="2">1 heart or less</option><option value="4">2 hearts or less</option><option value="6">3 hearts or less</option><option value="10">5 hearts or less</option></select>
+        </label>
+        <label class="field"><span>Extra chat keywords</span><input name="keywords" placeholder="e.g. tpa, trade" autocomplete="off"></label>
+      </div>
+    </section>
+
+    <section class="group" id="updates">
+      <h3>Updates</h3>
+      <p class="sub" id="updText"></p>
+      <div class="upd-bar" id="updBar" hidden><i id="updFill"></i></div>
+      <div class="inline wrap-row">
+        <button type="button" class="btn primary" id="updInstall" hidden></button>
+        <button type="button" class="btn" id="updCheck">Check for updates</button>
+        <button type="button" class="btn" id="updZip">Install update from a zip</button>
+        <input type="file" id="updFile" accept=".zip,application/zip" hidden>
+      </div>
+    </section>
+
+    <section class="group">
+      <h3>This computer</h3>
+      <label class="switch"><input type="checkbox" name="allowPhone"><span>Open the dashboard from my phone on the same Wi-Fi</span></label>
+      <p class="sub" id="lanHint"></p>
+      <label class="switch" id="startupRow"><input type="checkbox" name="startWithWindows"><span>Start Golem AFK in the background when Windows starts</span></label>
+      <div class="two">
+        <label class="field"><span>New dashboard password</span><input type="password" name="password" minlength="6" autocomplete="new-password" placeholder="Leave empty to keep it"></label>
+        <label class="field"><span>Dashboard port</span><input name="port" type="number" min="1024" max="65535"></label>
+      </div>
+    </section>
+
+    <p class="form-error" id="setError" role="alert"></p>
+    <footer>
+      <button type="button" class="btn subtle" id="signOut">Sign out</button>
+      <button type="button" class="btn subtle danger" id="quitApp">Quit Golem AFK</button>
+      <span class="grow"></span>
+      <button class="btn primary">Save settings</button>
+    </footer>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

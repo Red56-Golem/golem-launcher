@@ -1,0 +1,196 @@
+'use strict'
+// Saves everything Golem AFK needs between runs in the data folder:
+// config.json (password, settings, bots) and history.json (online/offline times).
+const fs = require('fs')
+const path = require('path')
+const crypto = require('crypto')
+
+const DATA = process.env.GOLEM_AFK_DATA || path.join(__dirname, '..', '..', 'data')
+fs.mkdirSync(DATA, { recursive: true })
+
+const CONFIG_FILE = path.join(DATA, 'config.json')
+const HISTORY_FILE = path.join(DATA, 'history.json')
+
+const DEFAULT_SETTINGS = {
+  port: 8080,
+  allowPhone: true,
+  webhookUrl: '',
+  alerts: {
+    kicked: true,
+    died: true,
+    lowHealth: true,
+    mentioned: true,
+    signIn: true,
+    stopped: true,
+    backOnline: false
+  },
+  lowHealth: 6,
+  keywords: '',
+  screenshotSeconds: 0, // screenshots were removed from the dashboard in 1.7.0
+  afkCommand: '/afk 1', // sends bots into Donut's AFK area
+  autoAfk: true, // send it again when a bot isn't in the AFK area
+  buyMob: 'Skeleton', // the spawner Buy now and auto-buy get
+  startWithWindows: false,
+  startDelay: 3 // seconds between bots starting
+}
+
+function botDefaults () {
+  return {
+    id: crypto.randomBytes(5).toString('hex'),
+    label: '',
+    edition: 'java',
+    host: 'og-donutsmp.net',
+    port: 25565,
+    version: 'auto',
+    auth: 'microsoft',
+    name: '',
+    account: '',
+    running: false,
+    reconnect: { on: true, delay: 15, onDuplicate: 'wait' },
+    antiAfk: { on: true, every: 30, actions: ['look', 'swing'] },
+    joinCommands: '',
+    repeat: { on: false, every: 10, commands: '' },
+    autoEat: true,
+    alerts: true,
+    macros: [],
+    group: '',
+    proxy: '', // '' = the group's proxy, 'none', or a proxy address
+    autoBuy: false,
+    // what the bot earned and bought (kept between runs)
+    tally: { earned: 0, day: '', today: 0, spent: 0, bought: {}, disconnects: 0, lastShardAt: 0 }
+  }
+}
+
+function merge (base, over) {
+  if (!over || typeof over !== 'object' || Array.isArray(over)) return over === undefined ? base : over
+  const out = Array.isArray(base) ? [] : { ...base }
+  for (const k of Object.keys(over)) {
+    if (base && typeof base[k] === 'object' && base[k] !== null && !Array.isArray(base[k])) out[k] = merge(base[k], over[k])
+    else out[k] = over[k]
+  }
+  return out
+}
+
+function readJson (file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return fallback }
+}
+
+function writeJson (file, value) {
+  const tmp = file + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2))
+  fs.renameSync(tmp, file)
+}
+
+const raw = readJson(CONFIG_FILE, {})
+const config = {
+  password: raw.password || null,
+  sessions: Array.isArray(raw.sessions) ? raw.sessions : [],
+  settings: merge(DEFAULT_SETTINGS, raw.settings || {}),
+  groups: Array.isArray(raw.groups) ? raw.groups : [], // [{ id, name, proxy }]
+  macros: Array.isArray(raw.macros) ? raw.macros : [], // macros for every bot (Macros tab)
+  donut: merge({ prices: null, pricesAt: 0 }, raw.donut || {}), // spawner prices read from /shop
+  bots: (Array.isArray(raw.bots) ? raw.bots : []).map(b => merge(botDefaults(), b))
+}
+
+// up to 1.6.0 the timing was in minutes
+if (raw.settings && raw.settings.screenshotSeconds === undefined && raw.settings.screenshotEvery !== undefined) {
+  config.settings.screenshotSeconds = Math.round(Number(raw.settings.screenshotEvery) * 60) || 0
+}
+delete config.settings.screenshotEvery
+config.settings.screenshotSeconds = 0 // no more screenshots (1.7.0)
+
+let saveTimer = null
+function save () {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(saveNow, 200)
+}
+function saveNow () {
+  clearTimeout(saveTimer)
+  writeJson(CONFIG_FILE, config)
+}
+
+const history = readJson(HISTORY_FILE, {})
+let historyTimer = null
+function saveHistory () {
+  if (historyTimer) return
+  historyTimer = setTimeout(() => {
+    historyTimer = null
+    const cutoff = Date.now() - 48 * 3600e3
+    for (const id of Object.keys(history)) {
+      if (id === '__alive') continue
+      if (!config.bots.some(b => b.id === id)) { delete history[id]; continue }
+      const list = history[id]
+      // keep the last change before the cutoff so the strip knows the starting state
+      let i = 0
+      while (i < list.length - 1 && list[i + 1].t < cutoff) i++
+      history[id] = list.slice(i)
+    }
+    writeJson(HISTORY_FILE, history)
+  }, 5000)
+}
+
+function addHistory (id, state) {
+  const list = history[id] || (history[id] = [])
+  const last = list[list.length - 1]
+  if (last && last.s === state) return
+  list.push({ t: Date.now(), s: state })
+  saveHistory()
+}
+
+function touchAlive () {
+  history.__alive = Date.now()
+  saveHistory()
+}
+
+// Password: scrypt hash with a random salt.
+function setPassword (pw) {
+  const salt = crypto.randomBytes(16).toString('hex')
+  const hash = crypto.scryptSync(pw, salt, 32).toString('hex')
+  config.password = { salt, hash }
+  config.sessions = []
+  saveNow()
+}
+function checkPassword (pw) {
+  if (!config.password) return false
+  const hash = crypto.scryptSync(String(pw), config.password.salt, 32)
+  return crypto.timingSafeEqual(hash, Buffer.from(config.password.hash, 'hex'))
+}
+function newSession () {
+  const token = crypto.randomBytes(24).toString('hex')
+  config.sessions.push({ token, created: Date.now() })
+  if (config.sessions.length > 20) config.sessions.splice(0, config.sessions.length - 20)
+  saveNow()
+  return token
+}
+function hasSession (token) {
+  return !!token && config.sessions.some(s => s.token === token)
+}
+function endSession (token) {
+  config.sessions = config.sessions.filter(s => s.token !== token)
+  saveNow()
+}
+
+// The proxy a bot connects through (from its group), or null. Throws on a bad proxy.
+function proxyForBot (cfg) {
+  if (cfg.proxy === 'none') return null
+  if (cfg.proxy) return require('./proxy').parseProxy(cfg.proxy)
+  const g = cfg.group && config.groups.find(x => x.id === cfg.group)
+  if (!g || !g.proxy) return null
+  return require('./proxy').parseProxy(g.proxy)
+}
+
+// At most this many bots may run through one proxy, or without a proxy.
+const PER_PROXY = 4
+
+// Which "lane" a bot uses: its group's proxy (host:port:user), or 'none'
+function proxyKey (cfg) {
+  let p = null
+  try { p = proxyForBot(cfg) } catch { return 'bad:' + cfg.group }
+  return p ? `${p.host.toLowerCase()}:${p.port}:${p.user}` : 'none'
+}
+
+module.exports = {
+  proxyForBot, proxyKey, PER_PROXY,
+  DATA, config, save, saveNow, merge, botDefaults, history, addHistory, touchAlive,
+  setPassword, checkPassword, newSession, hasSession, endSession
+}
